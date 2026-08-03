@@ -53,7 +53,9 @@
     ".ytp-skip-ad-button"
   ];
 
-  let userStartedPlayback = false;
+  let hasStartedPlayback = false;
+  let shouldResumeInBackground = false;
+  let appIsActive = true;
 
   function hideElement(element) {
     if (!element || element.dataset.ytproHidden === "1") {
@@ -88,13 +90,14 @@
   function rememberPlayback() {
     for (const video of document.querySelectorAll("video")) {
       if (!video.paused && !video.ended) {
-        userStartedPlayback = true;
+        hasStartedPlayback = true;
+        shouldResumeInBackground = true;
       }
     }
   }
 
   function resumePlaybackIfNeeded() {
-    if (!userStartedPlayback) {
+    if (appIsActive || !hasStartedPlayback || !shouldResumeInBackground) {
       return;
     }
 
@@ -103,6 +106,70 @@
         video.play().catch(function () {});
       }
     }
+  }
+
+  function isFullscreenVideo(video) {
+    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+
+    return fullscreenElement === video ||
+      (fullscreenElement && fullscreenElement.contains && fullscreenElement.contains(video)) ||
+      video.webkitPresentationMode === "fullscreen";
+  }
+
+  function enablePictureInPicture(video) {
+    try {
+      video.removeAttribute("disablepictureinpicture");
+      video.disablePictureInPicture = false;
+    } catch (_) {
+    }
+  }
+
+  function requestPictureInPictureIfNeeded() {
+    if (!hasStartedPlayback || !shouldResumeInBackground) {
+      return;
+    }
+
+    for (const video of document.querySelectorAll("video")) {
+      if (video.paused || video.ended || !isFullscreenVideo(video)) {
+        continue;
+      }
+
+      enablePictureInPicture(video);
+
+      try {
+        if (
+          video.webkitPresentationMode === "picture-in-picture" ||
+          document.pictureInPictureElement === video
+        ) {
+          continue;
+        }
+
+        if (typeof video.webkitSetPresentationMode === "function") {
+          video.webkitSetPresentationMode("picture-in-picture");
+        } else if (
+          document.pictureInPictureEnabled &&
+          typeof video.requestPictureInPicture === "function"
+        ) {
+          video.requestPictureInPicture().catch(function () {});
+        }
+      } catch (_) {
+      }
+    }
+  }
+
+  function installLifecycleBridge() {
+    window.__ytproSetAppActive = function (isActive) {
+      appIsActive = Boolean(isActive);
+
+      if (!appIsActive) {
+        requestPictureInPictureIfNeeded();
+        resumePlaybackIfNeeded();
+        window.setTimeout(function () {
+          requestPictureInPictureIfNeeded();
+          resumePlaybackIfNeeded();
+        }, 600);
+      }
+    };
   }
 
   function installVisibilityPatch() {
@@ -134,10 +201,25 @@
         }
 
         video.dataset.ytproObserved = "1";
-        video.addEventListener("play", rememberPlayback, { passive: true });
-        video.addEventListener("playing", rememberPlayback, { passive: true });
+        enablePictureInPicture(video);
+        video.addEventListener("play", function () {
+          hasStartedPlayback = true;
+          shouldResumeInBackground = true;
+        }, { passive: true });
+        video.addEventListener("playing", function () {
+          hasStartedPlayback = true;
+          shouldResumeInBackground = true;
+        }, { passive: true });
         video.addEventListener("pause", function () {
+          if (appIsActive) {
+            shouldResumeInBackground = false;
+            return;
+          }
+
           window.setTimeout(resumePlaybackIfNeeded, 400);
+        }, { passive: true });
+        video.addEventListener("ended", function () {
+          shouldResumeInBackground = false;
         }, { passive: true });
       });
     } catch (_) {
@@ -150,6 +232,7 @@
     rememberPlayback();
   }
 
+  installLifecycleBridge();
   installVisibilityPatch();
 
   const observer = new MutationObserver(function (mutations) {

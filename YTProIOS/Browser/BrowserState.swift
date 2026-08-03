@@ -1,4 +1,5 @@
 import Combine
+import UIKit
 import WebKit
 
 @MainActor
@@ -9,10 +10,12 @@ final class BrowserState: NSObject, ObservableObject {
     @Published private(set) var isLoading = false
 
     let webView: WKWebView
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     override init() {
         let configuration = WKWebViewConfiguration()
         configuration.allowsInlineMediaPlayback = true
+        configuration.allowsPictureInPictureMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -30,8 +33,13 @@ final class BrowserState: NSObject, ObservableObject {
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.contentInsetAdjustmentBehavior = .never
+        installLifecycleObservers()
 
         loadHome()
+    }
+
+    deinit {
+        lifecycleObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
     func loadHome() {
@@ -66,6 +74,36 @@ final class BrowserState: NSObject, ObservableObject {
         }
 
         refreshState()
+    }
+
+    private func installLifecycleObservers() {
+        let center = NotificationCenter.default
+
+        lifecycleObservers = [
+            center.addObserver(
+                forName: UIApplication.willResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.notifyWebViewAppActive(false)
+                }
+            },
+            center.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.notifyWebViewAppActive(true)
+                }
+            }
+        ]
+    }
+
+    private func notifyWebViewAppActive(_ isActive: Bool) {
+        let value = isActive ? "true" : "false"
+        webView.evaluateJavaScript("window.__ytproSetAppActive && window.__ytproSetAppActive(\(value));")
     }
 
     private func refreshState() {
