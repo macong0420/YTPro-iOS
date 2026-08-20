@@ -55,7 +55,15 @@
 
   let hasStartedPlayback = false;
   let shouldResumeInBackground = false;
+  let backgroundPlaybackWasActive = false;
   let appIsActive = true;
+  let backgroundRecoveryAllowed = false;
+  let backgroundRecoveryAttempts = 0;
+  let backgroundRecoveryScheduled = false;
+  let backgroundRecoveryToken = 0;
+  let backgroundRecoveryWindowToken = 0;
+  let foregroundRecoveryToken = 0;
+  let foregroundRecoveryInProgress = false;
   const observedVideos = new Set();
   const pendingRoots = new Set();
   let incrementalScanScheduled = false;
@@ -145,18 +153,53 @@
     }
   }
 
-  function isFullscreenVideo(video) {
-    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
-
-    return fullscreenElement === video ||
-      (fullscreenElement && fullscreenElement.contains && fullscreenElement.contains(video)) ||
-      video.webkitPresentationMode === "fullscreen";
+  function isPictureInPictureVideo(video) {
+    return video.webkitPresentationMode === "picture-in-picture" ||
+      document.pictureInPictureElement === video;
   }
 
   function enablePictureInPicture(video) {
     try {
       video.removeAttribute("disablepictureinpicture");
       video.disablePictureInPicture = false;
+      video.setAttribute("playsinline", "");
+      video.setAttribute("webkit-playsinline", "");
+      video.playsInline = true;
+    } catch (_) {
+    }
+  }
+
+  function restoreInlinePresentation(video) {
+    const presentationMode = video.webkitPresentationMode;
+
+    try {
+      if (
+        document.pictureInPictureElement === video &&
+        typeof document.exitPictureInPicture === "function"
+      ) {
+        const exitPictureInPictureResult = document.exitPictureInPicture();
+        if (exitPictureInPictureResult && typeof exitPictureInPictureResult.catch === "function") {
+          exitPictureInPictureResult.catch(function () {});
+        }
+      }
+
+      if (
+        (isPictureInPictureVideo(video) || presentationMode === "fullscreen") &&
+        typeof video.webkitSetPresentationMode === "function"
+      ) {
+        video.webkitSetPresentationMode("inline");
+      }
+
+      if (
+        presentationMode === "fullscreen" &&
+        document.fullscreenElement &&
+        typeof document.exitFullscreen === "function"
+      ) {
+        const exitFullscreenResult = document.exitFullscreen();
+        if (exitFullscreenResult && typeof exitFullscreenResult.catch === "function") {
+          exitFullscreenResult.catch(function () {});
+        }
+      }
     } catch (_) {
     }
   }
@@ -167,26 +210,20 @@
     }
 
     for (const video of trackedVideos()) {
-      if (video.paused || video.ended || !isFullscreenVideo(video)) {
+      if (video.paused || video.ended) {
         continue;
       }
 
       enablePictureInPicture(video);
 
       try {
-        if (
-          video.webkitPresentationMode === "picture-in-picture" ||
-          document.pictureInPictureElement === video
-        ) {
+        if (isPictureInPictureVideo(video)) {
           continue;
         }
 
         if (typeof video.webkitSetPresentationMode === "function") {
           video.webkitSetPresentationMode("picture-in-picture");
-        } else if (
-          document.pictureInPictureEnabled &&
-          typeof video.requestPictureInPicture === "function"
-        ) {
+        } else if (typeof video.requestPictureInPicture === "function") {
           video.requestPictureInPicture().catch(function () {});
         }
       } catch (_) {
@@ -194,18 +231,136 @@
     }
   }
 
-  function installLifecycleBridge() {
-    window.__ytproSetAppActive = function (isActive) {
-      appIsActive = Boolean(isActive);
+  function scheduleBackgroundPauseRecovery() {
+    if (
+      !backgroundRecoveryAllowed ||
+      backgroundRecoveryScheduled ||
+      backgroundRecoveryAttempts >= 3
+    ) {
+      return;
+    }
 
-      if (!appIsActive) {
-        requestPictureInPictureIfNeeded();
-        resumePlaybackIfNeeded();
-        window.setTimeout(function () {
-          requestPictureInPictureIfNeeded();
-          resumePlaybackIfNeeded();
-        }, 600);
+    backgroundRecoveryScheduled = true;
+    const recoveryToken = ++backgroundRecoveryToken;
+    window.setTimeout(function () {
+      if (recoveryToken !== backgroundRecoveryToken) {
+        return;
       }
+
+      backgroundRecoveryScheduled = false;
+
+      if (!backgroundRecoveryAllowed || !shouldResumeInBackground) {
+        return;
+      }
+
+      backgroundRecoveryAttempts += 1;
+      resumePlaybackIfNeeded();
+    }, 400);
+  }
+
+  function prepareForBackground() {
+    appIsActive = false;
+    backgroundRecoveryAttempts = 0;
+    backgroundRecoveryToken += 1;
+    backgroundPlaybackWasActive = trackedVideos().some(function (video) {
+      return !video.paused && !video.ended;
+    });
+    backgroundRecoveryAllowed = backgroundPlaybackWasActive;
+
+    shouldResumeInBackground = backgroundRecoveryAllowed;
+
+    if (!backgroundRecoveryAllowed) {
+      return;
+    }
+
+    requestPictureInPictureIfNeeded();
+
+    const recoveryWindowToken = ++backgroundRecoveryWindowToken;
+    window.setTimeout(function () {
+      if (recoveryWindowToken !== backgroundRecoveryWindowToken) {
+        return;
+      }
+
+      backgroundRecoveryAllowed = false;
+    }, 1500);
+  }
+
+  function didEnterBackground() {
+    appIsActive = false;
+    requestPictureInPictureIfNeeded();
+    resumePlaybackIfNeeded();
+  }
+
+  function prepareForForeground() {
+    appIsActive = true;
+    backgroundRecoveryAllowed = false;
+    backgroundRecoveryScheduled = false;
+    backgroundRecoveryToken += 1;
+    backgroundRecoveryWindowToken += 1;
+    foregroundRecoveryToken += 1;
+    foregroundRecoveryInProgress = true;
+  }
+
+  function recoverAfterForeground() {
+    const shouldResume = backgroundPlaybackWasActive && shouldResumeInBackground;
+    const recoveryToken = ++foregroundRecoveryToken;
+
+    appIsActive = true;
+    backgroundRecoveryAllowed = false;
+    backgroundRecoveryScheduled = false;
+    backgroundRecoveryToken += 1;
+    backgroundRecoveryWindowToken += 1;
+    foregroundRecoveryInProgress = true;
+
+    for (const video of trackedVideos()) {
+      enablePictureInPicture(video);
+
+      // A failed or interrupted PiP/fullscreen transition can leave WebKit's
+      // media layer detached after the app becomes active again. Return the
+      // element to inline presentation before asking it to render a frame.
+      restoreInlinePresentation(video);
+    }
+
+    if (!shouldResume) {
+      foregroundRecoveryInProgress = false;
+      backgroundPlaybackWasActive = false;
+      return;
+    }
+
+    window.setTimeout(function () {
+      if (
+        recoveryToken !== foregroundRecoveryToken ||
+        !shouldResumeInBackground
+      ) {
+        foregroundRecoveryInProgress = false;
+        return;
+      }
+
+      for (const video of trackedVideos()) {
+        if (!video.ended) {
+          video.play().catch(function () {});
+        }
+      }
+
+      foregroundRecoveryInProgress = false;
+      backgroundPlaybackWasActive = false;
+      shouldResumeInBackground = false;
+    }, 120);
+  }
+
+  function installLifecycleBridge() {
+    window.__ytproPrepareForBackground = prepareForBackground;
+    window.__ytproDidEnterBackground = didEnterBackground;
+    window.__ytproPrepareForForeground = prepareForForeground;
+    window.__ytproRecoverAfterForeground = recoverAfterForeground;
+    window.__ytproSetAppActive = function (isActive) {
+      if (Boolean(isActive)) {
+        recoverAfterForeground();
+        return;
+      }
+
+      prepareForBackground();
+      didEnterBackground();
     };
   }
 
@@ -246,11 +401,27 @@
     }, { passive: true });
     video.addEventListener("pause", function () {
       if (appIsActive) {
+        if (!foregroundRecoveryInProgress) {
+          shouldResumeInBackground = false;
+          backgroundRecoveryAllowed = false;
+          backgroundPlaybackWasActive = false;
+          foregroundRecoveryToken += 1;
+        }
+        return;
+      }
+
+      if (isPictureInPictureVideo(video)) {
+        shouldResumeInBackground = false;
+        backgroundRecoveryAllowed = false;
+        return;
+      }
+
+      if (!backgroundRecoveryAllowed) {
         shouldResumeInBackground = false;
         return;
       }
 
-      window.setTimeout(resumePlaybackIfNeeded, 400);
+      scheduleBackgroundPauseRecovery();
     }, { passive: true });
     video.addEventListener("ended", function () {
       shouldResumeInBackground = false;

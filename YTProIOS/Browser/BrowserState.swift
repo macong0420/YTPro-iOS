@@ -81,12 +81,24 @@ final class BrowserState: NSObject, ObservableObject {
 
         lifecycleObservers = [
             center.addObserver(
+                // PiP must be requested before the application enters the
+                // background. Waiting for didEnterBackground is too late for
+                // WebKit to present the native floating video window reliably.
                 forName: UIApplication.willResignActiveNotification,
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.notifyWebViewAppActive(false)
+                MainActor.assumeIsolated {
+                    self?.notifyWebViewLifecycle("__ytproPrepareForBackground")
+                }
+            },
+            center.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.notifyWebViewLifecycle("__ytproDidEnterBackground")
                 }
             },
             center.addObserver(
@@ -94,16 +106,54 @@ final class BrowserState: NSObject, ObservableObject {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.notifyWebViewAppActive(true)
+                MainActor.assumeIsolated {
+                    self?.restoreWebViewAfterForeground()
                 }
             }
         ]
     }
 
+    private func notifyWebViewLifecycle(_ functionName: String) {
+        webView.evaluateJavaScript("window.\(functionName) && window.\(functionName)();")
+    }
+
     private func notifyWebViewAppActive(_ isActive: Bool) {
         let value = isActive ? "true" : "false"
         webView.evaluateJavaScript("window.__ytproSetAppActive && window.__ytproSetAppActive(\(value));")
+
+        guard isActive else {
+            return
+        }
+
+        // The web content process may still be reconnecting its media layer
+        // when didBecomeActive fires. Retry the idempotent bridge after layout
+        // has settled so a missed first evaluation cannot leave audio-only
+        // playback behind.
+        for delay in [0.15, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.webView.evaluateJavaScript(
+                    "window.__ytproSetAppActive && window.__ytproSetAppActive(true);"
+                )
+            }
+        }
+    }
+
+    private func restoreWebViewAfterForeground() {
+        webView.isHidden = false
+        webView.alpha = 1
+        webView.setNeedsLayout()
+        webView.layoutIfNeeded()
+        webView.scrollView.setNeedsLayout()
+        webView.scrollView.layoutIfNeeded()
+
+        // A WebKit PiP/fullscreen transition can outlive the scene transition
+        // and leave its out-of-window media layer attached to a stale surface.
+        // Close that presentation first; the JS bridge then restores inline
+        // playback and resumes only when playback was active before background.
+        notifyWebViewLifecycle("__ytproPrepareForForeground")
+        webView.closeAllMediaPresentations { [weak self] in
+            self?.notifyWebViewAppActive(true)
+        }
     }
 
     private func refreshState() {
