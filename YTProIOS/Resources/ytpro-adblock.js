@@ -98,6 +98,15 @@
   const renderProbeClockDeltaSeconds = 0.05;
   const repaintAttemptLimit = 2;
 
+  // The fullscreen teardown interrupted by opening the floating window can
+  // complete late: seconds after the app is back and the element was already
+  // restored inline, WebKit flips it back to fullscreen behind the player's
+  // back. A player told inline while the platform presents something else is
+  // what leaves its controls unresponsive, so the restore is watched for a
+  // few seconds and the drift is corrected.
+  const presentationDriftCheckDelaysMilliseconds = [1200, 2400, 3600, 5000];
+  const driftResumeRetryDelayMilliseconds = 300;
+
   const playbackSyncIntervalMilliseconds = 1000;
 
   // The bridge announcing the background trip runs through `evaluateJavaScript`
@@ -639,19 +648,12 @@
     // Fullscreen playback continues as a floating window. Inline playback is
     // only meant to keep its audio, so its presentation is left untouched.
     //
-    // A floating window requested straight out of native fullscreen makes
-    // `AVPlayerViewController` fight its own teardown (`exitFullScreenAnimated
-    // ... Invalid call`) and leaves a detached media layer behind: black video,
-    // live audio and a fullscreen button that no longer reacts once the app is
-    // back. Collapsing to inline first lets that teardown run to completion;
-    // the retry chain below lands the floating window once it has. A
-    // page-driven fullscreen layout involves no view controller and needs no
-    // such preparation.
-    if (backgroundPresentationMode === FULLSCREEN &&
-        nativePresentationModeOf(video) === FULLSCREEN) {
-      setPresentationMode(video, INLINE);
-    }
-
+    // Collapsing native fullscreen before the request was tried and is worse
+    // on both ends: WebKit silently refuses a Picture in Picture request made
+    // from plain inline with no user gesture behind it, so the window never
+    // appears at all, while a request made straight out of fullscreen is
+    // honoured — and the fullscreen teardown rumbling underneath it is the
+    // same transition WebKit performs for its own automatic handover.
     if (backgroundPresentationMode === FULLSCREEN) {
       requestPictureInPicture(video, 0);
     }
@@ -800,9 +802,54 @@
 
     backgroundPlaybackIntended = false;
 
+    watchPresentationDrift(video, restoreToken, 0);
+
     window.setTimeout(function () {
       probeRendering(video, restoreToken);
     }, renderProbeIntervalMilliseconds);
+  }
+
+  // Page-driven fullscreen layouts are the player's own coherent state and are
+  // left alone; only native presentations the player knows nothing about are
+  // corrected. A gesture in progress means the change is the user's doing.
+  function watchPresentationDrift(video, restoreToken, index) {
+    if (
+      restoreToken !== foregroundRestoreToken ||
+      index >= presentationDriftCheckDelaysMilliseconds.length
+    ) {
+      return;
+    }
+
+    window.setTimeout(function () {
+      if (restoreToken !== foregroundRestoreToken) {
+        return;
+      }
+
+      const nativeMode = nativePresentationModeOf(video);
+
+      if (
+        (nativeMode === FULLSCREEN || nativeMode === PICTURE_IN_PICTURE) &&
+        !recentUserGesture()
+      ) {
+        const wasPlaying = !video.paused && !video.ended;
+
+        logToNative(
+          "presentation drifted to " + nativeMode + ", restoring " + INLINE
+        );
+        setPresentationMode(video, INLINE);
+
+        if (wasPlaying) {
+          ignoreRejection(video.play());
+          window.setTimeout(function () {
+            if (restoreToken === foregroundRestoreToken && video.paused && !video.ended) {
+              ignoreRejection(video.play());
+            }
+          }, driftResumeRetryDelayMilliseconds);
+        }
+      }
+
+      watchPresentationDrift(video, restoreToken, index + 1);
+    }, presentationDriftCheckDelaysMilliseconds[index]);
   }
 
   function waitForPresentation(video, targetMode, restoreToken, attempt) {
