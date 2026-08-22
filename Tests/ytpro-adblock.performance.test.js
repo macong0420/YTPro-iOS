@@ -38,13 +38,41 @@ class FakeElement {
     this.listeners = new Map();
     this.paused = true;
     this.ended = false;
+    this.currentTime = 0;
+    this.decodedFrames = 0;
+    this.repaintCount = 0;
     this.webkitPresentationMode = "inline";
+    this.webkitDisplayingFullscreen = false;
+    this.disablePictureInPicture = true;
+    this.rect = { width: 320, height: 180 };
     this.styleValues = new Map();
     this.style = {
       setProperty: (name, value) => {
         this.styleValues.set(name, value);
+      },
+      removeProperty: (name) => {
+        this.styleValues.delete(name);
+      },
+      get display() {
+        return "";
       }
     };
+  }
+
+  get offsetHeight() {
+    if (this.styleValues.get("display") === "none") {
+      this.repaintCount += 1;
+    }
+
+    return 180;
+  }
+
+  getBoundingClientRect() {
+    return this.rect;
+  }
+
+  getVideoPlaybackQuality() {
+    return { totalVideoFrames: this.decodedFrames };
   }
 
   append(child) {
@@ -100,9 +128,6 @@ class FakeElement {
     }
   }
 
-  removeAttribute() {
-  }
-
   setAttribute() {
   }
 
@@ -110,10 +135,19 @@ class FakeElement {
     this.presentationModeRequests.push(mode);
   }
 
+  removeAttribute() {
+  }
+
   play() {
     this.paused = false;
     this.playCount += 1;
+    this.dispatch("playing");
     return Promise.resolve();
+  }
+
+  setPresentationMode(mode) {
+    this.webkitPresentationMode = mode;
+    this.dispatch("webkitpresentationmodechanged");
   }
 }
 
@@ -128,6 +162,7 @@ class FakeDocument {
     this.pictureInPictureElement = null;
     this.pictureInPictureEnabled = false;
     this.queryCount = 0;
+    this.listeners = new Map();
   }
 
   querySelectorAll(selector) {
@@ -135,7 +170,20 @@ class FakeDocument {
     return collectMatches([this.documentElement], selector);
   }
 
-  addEventListener() {
+  querySelector(selector) {
+    return collectMatches([this.documentElement], selector)[0] || null;
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatch(type) {
+    for (const listener of this.listeners.get(type) || []) {
+      listener({ type });
+    }
   }
 }
 
@@ -159,7 +207,9 @@ function createHarness() {
   const document = new FakeDocument(documentRoot);
   const timeouts = [];
   const intervals = [];
+  const nativeMessages = [];
   let mutationCallback;
+  let clock = 1_000_000;
 
   class FakeMutationObserver {
     constructor(callback) {
@@ -172,9 +222,27 @@ function createHarness() {
 
   const window = {
     location: { hostname: "m.youtube.com" },
+    innerWidth: 390,
+    innerHeight: 844,
+    webkit: {
+      messageHandlers: {
+        ytpro: {
+          postMessage(payload) {
+            nativeMessages.push(payload);
+          }
+        }
+      }
+    },
     setTimeout(callback, delay) {
-      timeouts.push({ callback, delay });
+      timeouts.push({ callback, delay, id: timeouts.length + 1 });
       return timeouts.length;
+    },
+    clearTimeout(id) {
+      const index = timeouts.findIndex((timer) => timer.id === id);
+
+      if (index >= 0) {
+        timeouts.splice(index, 1);
+      }
     },
     setInterval(callback, delay) {
       intervals.push({ callback, delay });
@@ -185,19 +253,32 @@ function createHarness() {
   vm.runInNewContext(scriptSource, {
     console,
     document,
+    // A controllable clock: the bridge separates WebKit's suspension pause from
+    // the user's by how long after the handover it arrived.
+    Date: { now: () => clock },
     MutationObserver: FakeMutationObserver,
     Node: { ELEMENT_NODE: 1 },
     window
   });
 
   return {
+    advanceClock(milliseconds) {
+      clock += milliseconds;
+    },
     document,
     documentRoot,
     intervals,
     mutationCallback,
+    nativeMessages,
     timeouts,
     window
   };
+}
+
+function playbackReports(harness) {
+  return harness.nativeMessages
+    .filter((message) => message.type === "playback")
+    .map((message) => message.playing);
 }
 
 function runNextTimeout(harness, expectedDelay) {
@@ -273,105 +354,452 @@ test("skip buttons are handled incrementally and full scans are low-frequency fa
 
   assert.equal(skipButton.clickCount, 1);
   assert.equal(harness.document.queryCount, initialDocumentQueries, "added nodes must not trigger a document scan");
-  assert.equal(harness.intervals.length, 1);
+  assert.equal(harness.intervals.length, 3);
   assert.equal(harness.intervals[0].delay, 5000);
+  assert.equal(harness.intervals[1].delay, 1000);
+  assert.equal(harness.intervals[2].delay, 1000);
 
   harness.intervals[0].callback();
   assert.ok(harness.document.queryCount > initialDocumentQueries, "the fallback interval should retain a full recovery scan");
+
+  harness.intervals[1].callback();
+  assert.equal(skipButton.clickCount, 2, "the skip poll clicks buttons that appeared without a mutation");
 });
 
-test("background playback starts only after the app actually enters background", () => {
+test("the native side drives one background handover and one foreground restore", () => {
   assert.match(browserStateSource, /UIApplication\.willResignActiveNotification/);
   assert.match(browserStateSource, /UIApplication\.didEnterBackgroundNotification/);
+  assert.match(browserStateSource, /UIApplication\.willEnterForegroundNotification/);
+  assert.match(browserStateSource, /UIApplication\.didBecomeActiveNotification/);
   assert.match(browserStateSource, /__ytproPrepareForBackground/);
   assert.match(browserStateSource, /__ytproDidEnterBackground/);
+  assert.match(browserStateSource, /__ytproHoldPlayback/);
   assert.match(browserStateSource, /__ytproPrepareForForeground/);
-  assert.match(browserStateSource, /closeAllMediaPresentations/);
+  assert.match(browserStateSource, /__ytproRecoverAfterForeground/);
+  assert.match(browserStateSource, /__ytproCancelBackgroundPreparation/);
+  assert.match(browserStateSource, /beginBackgroundTask/, "a frozen web process cannot resume itself");
+  assert.doesNotMatch(
+    browserStateSource,
+    /closeAllMediaPresentations/,
+    "closing presentations natively races the transition the bridge is already running"
+  );
 });
 
-test("a manually paused video never starts just because the app enters background", () => {
+test("a manually paused video is never started by the app leaving the foreground", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
+  // The tap on the player is what marks this pause as the user's.
+  harness.document.dispatch("pointerdown");
   video.paused = true;
   video.dispatch("pause");
   harness.window.__ytproPrepareForBackground();
-  harness.window.__ytproSetAppActive(false);
+  harness.window.__ytproDidEnterBackground();
+  video.dispatch("pause");
 
   assert.equal(video.playCount, 0);
   assert.deepEqual(video.presentationModeRequests, []);
 });
 
-test("a pause caused during the background transition is recovered once", () => {
+test("inline playback keeps its audio without opening a floating window", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
   harness.window.__ytproPrepareForBackground();
-  video.paused = true;
-  video.dispatch("pause");
+  harness.window.__ytproDidEnterBackground();
 
-  runTimeouts(harness, 400);
+  assert.deepEqual(video.presentationModeRequests, [], "audio only playback stays inline");
 
-  assert.equal(video.playCount, 1);
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
-});
-
-test("foreground recovery returns a detached video to inline mode and resumes it", () => {
-  const harness = createHarness();
-  const video = attachPlayingVideo(harness);
-
-  harness.window.__ytproPrepareForBackground();
-  video.webkitPresentationMode = "picture-in-picture";
-  video.paused = true;
-  harness.window.__ytproSetAppActive(true);
-
-  runTimeouts(harness, 120);
-
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture", "inline"]);
-  assert.equal(video.playCount, 1);
-});
-
-test("a native media close during foreground preparation does not look like a user pause", () => {
-  const harness = createHarness();
-  const video = attachPlayingVideo(harness);
-
-  harness.window.__ytproPrepareForBackground();
-  harness.window.__ytproPrepareForForeground();
-  video.paused = true;
-  video.dispatch("pause");
-  harness.window.__ytproSetAppActive(true);
-
-  runTimeouts(harness, 120);
-
-  assert.equal(video.playCount, 1);
-});
-
-test("a later pause in Picture in Picture is treated as a manual pause", () => {
-  const harness = createHarness();
-  const video = attachPlayingVideo(harness);
-
-  harness.window.__ytproPrepareForBackground();
-  video.paused = true;
-  video.dispatch("pause");
-  runTimeouts(harness, 400);
-
-  video.webkitPresentationMode = "picture-in-picture";
+  // WebKit suspends the media session a moment after the app leaves the screen.
   video.paused = true;
   video.dispatch("pause");
 
   assert.equal(video.playCount, 1);
 });
 
-test("a manual background pause after the transition window is not restarted", () => {
+test("a suspended web process is resumed by the native hold ping", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
   harness.window.__ytproPrepareForBackground();
-  runTimeouts(harness, 1500);
+  harness.window.__ytproDidEnterBackground();
+
+  // The pause event is never delivered because the process was already frozen.
+  video.paused = true;
+  harness.window.__ytproHoldPlayback();
+
+  assert.equal(video.playCount, 1);
+});
+
+test("only the playing video takes part in the background handover", () => {
+  const harness = createHarness();
+  const preview = new FakeElement("video");
+
+  harness.documentRoot.append(preview);
+  harness.mutationCallback([{ addedNodes: [preview] }]);
+  runNextTimeout(harness, 0);
+
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  video.paused = true;
+  video.dispatch("pause");
+
+  assert.equal(video.playCount, 1);
+  assert.equal(preview.playCount, 0, "a preview player must stay untouched");
+});
+
+test("a pause after the transition window belongs to the user", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  runTimeouts(harness, 15000);
 
   video.paused = true;
   video.dispatch("pause");
 
   assert.equal(video.playCount, 0);
-  assert.equal(harness.timeouts.some((timer) => timer.delay === 400), false);
+});
+
+test("fullscreen playback hands over to a floating window before the app backgrounds", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+  assert.equal(video.disablePictureInPicture, false, "the player may forbid the floating window");
+});
+
+test("fullscreen driven by the page layout hands over as well", () => {
+  const harness = createHarness();
+  const playerShell = new FakeElement("ytm-app", ["ytm-app[player-fullscreen]"]);
+
+  harness.documentRoot.append(playerShell);
+
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+});
+
+test("a video stretched over the whole viewport counts as fullscreen", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.rect = { width: 390, height: 844 };
+  harness.window.__ytproPrepareForBackground();
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+});
+
+test("a dropped Picture in Picture request is retried while the app is still on screen", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  runTimeouts(harness, 60);
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture", "picture-in-picture"]);
+
+  video.setPresentationMode("picture-in-picture");
+  runTimeouts(harness, 200);
+
+  assert.equal(video.presentationModeRequests.length, 2, "a live floating window ends the retries");
+});
+
+test("a pause in the floating window belongs to the user", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+  harness.window.__ytproDidEnterBackground();
+
+  // Well clear of the handover, so this can only be a tap on the window's own
+  // controls.
+  harness.advanceClock(5000);
+  video.paused = true;
+  video.dispatch("pause");
+
+  assert.equal(video.playCount, 0);
+});
+
+test("a pause during the handover into the floating window is not the user", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+
+  // WebKit suspends the element while the handover is still settling. The
+  // window's controls leave no gesture behind, so only its timing separates
+  // this from a real tap.
+  video.paused = true;
+  video.dispatch("pause");
+
+  assert.equal(video.playCount, 1, "the handover must not be read as the user giving up");
+});
+
+test("returning to the foreground leaves the floating window once and resumes playback", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+  harness.window.__ytproDidEnterBackground();
+  video.paused = true;
+
+  harness.window.__ytproPrepareForForeground();
+  harness.window.__ytproRecoverAfterForeground();
+  harness.window.__ytproRecoverAfterForeground();
+
+  assert.deepEqual(
+    video.presentationModeRequests,
+    ["picture-in-picture", "inline"],
+    "entering the floating window tore the fullscreen presentation down; there is nothing to restore"
+  );
+
+  video.setPresentationMode("inline");
+  runTimeouts(harness, 60);
+
+  assert.equal(video.playCount, 1);
+});
+
+test("a floating window the user opened is left alone on the way back", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.setPresentationMode("picture-in-picture");
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  harness.window.__ytproPrepareForForeground();
+  harness.window.__ytproRecoverAfterForeground();
+
+  assert.deepEqual(video.presentationModeRequests, []);
+});
+
+test("a transient deactivation rolls the floating window back", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+  harness.window.__ytproCancelBackgroundPreparation();
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture", "inline"]);
+  assert.equal(video.playCount, 0);
+});
+
+test("a media layer that stopped painting is handed a fresh surface", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  harness.window.__ytproPrepareForForeground();
+  harness.window.__ytproRecoverAfterForeground();
+
+  runTimeouts(harness, 400);
+  video.currentTime += 1;
+  runTimeouts(harness, 400);
+
+  assert.equal(video.repaintCount, 1);
+  assert.equal(video.styleValues.get("display"), undefined, "the player's own layout is restored");
+});
+
+test("playback that keeps painting is never repainted", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  harness.window.__ytproPrepareForForeground();
+  harness.window.__ytproRecoverAfterForeground();
+
+  runTimeouts(harness, 400);
+  video.currentTime += 1;
+  video.decodedFrames += 30;
+  runTimeouts(harness, 400);
+
+  assert.equal(video.repaintCount, 0);
+});
+
+test("playback that started before the listeners attached is still reported", () => {
+  const harness = createHarness();
+  const video = new FakeElement("video");
+
+  // The player can begin playing before the observer reaches the element, and
+  // the `playing` event is then lost — native would never claim the audio
+  // session that background playback depends on.
+  video.paused = false;
+  harness.documentRoot.append(video);
+  harness.mutationCallback([{ addedNodes: [video] }]);
+  runNextTimeout(harness, 0);
+
+  assert.deepEqual(playbackReports(harness), [], "the lost event reports nothing on its own");
+
+  harness.intervals[2].callback();
+
+  assert.deepEqual(playbackReports(harness), [true]);
+});
+
+test("the playback poll reports only when the state actually changed", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  assert.deepEqual(playbackReports(harness), [true]);
+
+  harness.intervals[2].callback();
+  harness.intervals[2].callback();
+
+  assert.deepEqual(playbackReports(harness), [true], "an unchanged state must not cross the bridge");
+
+  video.paused = true;
+  harness.intervals[2].callback();
+
+  assert.deepEqual(playbackReports(harness), [true, false]);
+});
+
+test("a pause between resigning active and backgrounding is not the user", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  // WebKit suspends the media session while the app is still only resigning
+  // active, so its pause lands before didEnterBackground. Locking the screen
+  // hits this every time, and reading it as a user pause silenced the trip.
+  harness.window.__ytproPrepareForBackground();
+  video.paused = true;
+  video.dispatch("pause");
+
+  assert.equal(video.playCount, 1, "the background transition begins at willResignActive");
+
+  harness.window.__ytproDidEnterBackground();
+
+  assert.equal(video.playCount, 1, "the trip must still be considered live");
+});
+
+test("a suspension pause that beat the bridge call still counts as playing", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  // `evaluateJavaScript` is asynchronous and the web process is already
+  // throttled when the app resigns active, so WebKit's suspension pause
+  // regularly reaches the element before prepareForBackground runs. No gesture
+  // preceded it, which is what separates it from the user pressing pause.
+  video.paused = true;
+  video.dispatch("pause");
+  harness.window.__ytproPrepareForBackground();
+
+  assert.equal(video.playCount, 1, "the trip must survive a pause that arrived first");
+
+  harness.window.__ytproDidEnterBackground();
+  video.paused = true;
+  video.dispatch("pause");
+
+  assert.equal(video.playCount, 2, "and the hold must keep resuming it");
+});
+
+test("a cancelled trip does not orphan the floating window it opened", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+
+  // A locking device sends a spurious activation, and the rollback it starts
+  // never completes because the screen goes off mid-transition.
+  harness.window.__ytproCancelBackgroundPreparation();
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  harness.window.__ytproPrepareForForeground();
+  harness.window.__ytproRecoverAfterForeground();
+
+  assert.deepEqual(
+    video.presentationModeRequests,
+    ["picture-in-picture", "inline", "inline"],
+    "the window must still be closed on the way back, or the inline player stays black"
+  );
+});
+
+test("an element already suspended before the bridge call is still resumed", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  // `video.paused` flips synchronously when WebKit suspends the app, while the
+  // `pause` event that would have told the bridge arrives as a later task.
+  // prepareForBackground therefore sees a paused element and no pause it can
+  // date — only that the element was playing a moment ago.
+  video.paused = true;
+  harness.window.__ytproPrepareForBackground();
+
+  assert.equal(video.playCount, 1, "a silently suspended element must still be resumed");
+});
+
+test("a video the user paused earlier is not revived by the handover", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  harness.document.dispatch("pointerdown");
+  video.paused = true;
+  video.dispatch("pause");
+
+  // The user walks away, then locks the screen a while later.
+  harness.advanceClock(30_000);
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+  video.dispatch("pause");
+
+  assert.equal(video.playCount, 0);
+});
+
+test("a floating window that never appears stops being requested", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  // A locked screen cannot present the floating window, and WebKit refuses
+  // every request without ever changing the presentation mode.
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+
+  for (let ping = 0; ping < 60; ping += 1) {
+    harness.window.__ytproHoldPlayback();
+  }
+
+  assert.equal(
+    video.presentationModeRequests.length,
+    6,
+    "hammering a refused handover for the whole hold window is what broke the element"
+  );
+});
+
+test("giving up on the floating window keeps the audio alive", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+  harness.window.__ytproDidEnterBackground();
+
+  for (let ping = 0; ping < 60; ping += 1) {
+    harness.window.__ytproHoldPlayback();
+  }
+
+  // WebKit suspends the media session a moment after the screen locks.
+  video.paused = true;
+  harness.window.__ytproHoldPlayback();
+
+  assert.equal(video.playCount, 1, "audio only is the most a locked screen can offer");
 });

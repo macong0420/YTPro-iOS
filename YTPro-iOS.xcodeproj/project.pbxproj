@@ -14,6 +14,7 @@
 		8A000005 /* YouTubeWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A000105 /* YouTubeWebView.swift */; };
 		8A000006 /* ytpro-adblock.js in Resources */ = {isa = PBXBuildFile; fileRef = 8A000106 /* ytpro-adblock.js */; };
 		8A000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8A000108 /* Assets.xcassets */; };
+		8A000008 /* AudioSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A000109 /* AudioSessionController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +27,7 @@
 		8A000106 /* ytpro-adblock.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "ytpro-adblock.js"; sourceTree = "<group>"; };
 		8A000107 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		8A000108 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		8A000109 /* AudioSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSessionController.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -70,6 +72,7 @@
 			children = (
 				8A000101 /* YTProIOSApp.swift */,
 				8A000102 /* AppDelegate.swift */,
+				8A000109 /* AudioSessionController.swift */,
 				8A000103 /* ContentView.swift */,
 			);
 			path = App;
@@ -166,6 +169,7 @@
 			files = (
 				8A000001 /* YTProIOSApp.swift in Sources */,
 				8A000002 /* AppDelegate.swift in Sources */,
+				8A000008 /* AudioSessionController.swift in Sources */,
 				8A000003 /* ContentView.swift in Sources */,
 				8A000004 /* BrowserState.swift in Sources */,
 				8A000005 /* YouTubeWebView.swift in Sources */,

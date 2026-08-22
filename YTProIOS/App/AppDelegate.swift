@@ -1,4 +1,3 @@
-import AVFoundation
 import UIKit
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
@@ -6,21 +5,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        configureAudioSession()
+        AudioSessionController.shared.configure()
         return true
-    }
-
-    func applicationDidBecomeActive(_ application: UIApplication) {
-        configureAudioSession()
-    }
-
-    private func configureAudioSession() {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .moviePlayback, options: [])
-            try session.setActive(true)
-        } catch {
-            assertionFailure("Failed to configure audio session: \(error)")
-        }
     }
 }
