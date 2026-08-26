@@ -464,18 +464,22 @@ test("a pause after the transition window belongs to the user", () => {
   assert.equal(video.playCount, 0);
 });
 
-test("fullscreen playback hands over to a floating window before the app backgrounds", () => {
+test("fullscreen playback is left to WebKit's own floating window handover", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
   video.webkitPresentationMode = "fullscreen";
   harness.window.__ytproPrepareForBackground();
 
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+  // The bridge must not ask for Picture in Picture while the fullscreen
+  // presentation is live — that request makes `AVPlayerViewController` fight
+  // its own teardown (`exitFullScreenAnimated ... Invalid call`) and detaches
+  // the media layer. WebKit hands the video to the floating window itself.
+  assert.deepEqual(video.presentationModeRequests, []);
   assert.equal(video.disablePictureInPicture, false, "the player may forbid the floating window");
 });
 
-test("fullscreen driven by the page layout hands over as well", () => {
+test("page-driven fullscreen is also left to the player", () => {
   const harness = createHarness();
   const playerShell = new FakeElement("ytm-app", ["ytm-app[player-fullscreen]"]);
 
@@ -485,33 +489,17 @@ test("fullscreen driven by the page layout hands over as well", () => {
 
   harness.window.__ytproPrepareForBackground();
 
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+  assert.deepEqual(video.presentationModeRequests, []);
 });
 
-test("a video stretched over the whole viewport counts as fullscreen", () => {
+test("a video stretched over the whole viewport is still left to the player", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
   video.rect = { width: 390, height: 844 };
   harness.window.__ytproPrepareForBackground();
 
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
-});
-
-test("a dropped Picture in Picture request is retried while the app is still on screen", () => {
-  const harness = createHarness();
-  const video = attachPlayingVideo(harness);
-
-  video.webkitPresentationMode = "fullscreen";
-  harness.window.__ytproPrepareForBackground();
-  runTimeouts(harness, 60);
-
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture", "picture-in-picture"]);
-
-  video.setPresentationMode("picture-in-picture");
-  runTimeouts(harness, 200);
-
-  assert.equal(video.presentationModeRequests.length, 2, "a live floating window ends the retries");
+  assert.deepEqual(video.presentationModeRequests, []);
 });
 
 test("a pause in the floating window belongs to the user", () => {
@@ -565,8 +553,8 @@ test("returning to the foreground leaves the floating window once and resumes pl
 
   assert.deepEqual(
     video.presentationModeRequests,
-    ["picture-in-picture", "inline"],
-    "entering the floating window tore the fullscreen presentation down; there is nothing to restore"
+    ["inline"],
+    "a hand-off window WebKit opened is closed once; there is nothing to restore"
   );
 
   video.setPresentationMode("inline");
@@ -588,7 +576,7 @@ test("a floating window the user opened is left alone on the way back", () => {
   assert.deepEqual(video.presentationModeRequests, []);
 });
 
-test("a transient deactivation rolls the floating window back", () => {
+test("a transient deactivation leaves no bridge-owned window to roll back", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
@@ -597,7 +585,7 @@ test("a transient deactivation rolls the floating window back", () => {
   video.setPresentationMode("picture-in-picture");
   harness.window.__ytproCancelBackgroundPreparation();
 
-  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture", "inline"]);
+  assert.deepEqual(video.presentationModeRequests, []);
   assert.equal(video.playCount, 0);
 });
 
@@ -710,7 +698,7 @@ test("a suspension pause that beat the bridge call still counts as playing", () 
   assert.equal(video.playCount, 2, "and the hold must keep resuming it");
 });
 
-test("a cancelled trip does not orphan the floating window it opened", () => {
+test("a cancelled trip never opened a floating window to orphan", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
@@ -718,19 +706,16 @@ test("a cancelled trip does not orphan the floating window it opened", () => {
   harness.window.__ytproPrepareForBackground();
   video.setPresentationMode("picture-in-picture");
 
-  // A locking device sends a spurious activation, and the rollback it starts
-  // never completes because the screen goes off mid-transition.
+  // A locking device sends a spurious activation. The bridge opened nothing,
+  // so its window stays exactly as it was — it must not be closed on the way
+  // back, or the inline player stays black.
   harness.window.__ytproCancelBackgroundPreparation();
   harness.window.__ytproPrepareForBackground();
   harness.window.__ytproDidEnterBackground();
   harness.window.__ytproPrepareForForeground();
   harness.window.__ytproRecoverAfterForeground();
 
-  assert.deepEqual(
-    video.presentationModeRequests,
-    ["picture-in-picture", "inline", "inline"],
-    "the window must still be closed on the way back, or the inline player stays black"
-  );
+  assert.deepEqual(video.presentationModeRequests, []);
 });
 
 test("an element already suspended before the bridge call is still resumed", () => {
@@ -764,12 +749,10 @@ test("a video the user paused earlier is not revived by the handover", () => {
   assert.equal(video.playCount, 0);
 });
 
-test("a floating window that never appears stops being requested", () => {
+test("no Picture in Picture request is made during the handover", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
-  // A locked screen cannot present the floating window, and WebKit refuses
-  // every request without ever changing the presentation mode.
   video.webkitPresentationMode = "fullscreen";
   harness.window.__ytproPrepareForBackground();
   harness.window.__ytproDidEnterBackground();
@@ -778,11 +761,10 @@ test("a floating window that never appears stops being requested", () => {
     harness.window.__ytproHoldPlayback();
   }
 
-  assert.equal(
-    video.presentationModeRequests.length,
-    6,
-    "hammering a refused handover for the whole hold window is what broke the element"
-  );
+  // The bridge leaves the fullscreen→Picture in Picture handover to WebKit.
+  // It asks for nothing, so a view that cannot present a window is never
+  // hammered into a detached media layer.
+  assert.deepEqual(video.presentationModeRequests, []);
 });
 
 test("giving up on the floating window keeps the audio alive", () => {

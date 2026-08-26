@@ -70,19 +70,6 @@
   // recovery path for selector changes caused only by class/attribute updates.
   const fallbackScanIntervalMilliseconds = 5000;
 
-  // Only the sliver between willResignActive and the actual suspension is left
-  // to hand playback over, so a dropped request is retried immediately — and
-  // kept being retried from the background hold below.
-  const pictureInPictureRetryDelaysMilliseconds = [60, 200, 500, 1200];
-
-  // A locked screen cannot present the floating window at all, and WebKit
-  // answers every request with the same silent refusal. Past this many attempts
-  // the retries stop being a recovery and become the fault: the background hold
-  // repeated the request every 250ms for its whole 15 second window, and ~60
-  // presentation changes in a row left the element unable to play at all.
-  // Giving up keeps the audio, which is the most a locked screen can offer.
-  const pictureInPictureAttemptLimit = 6;
-
   // How long a pause is still attributed to the background transition instead
   // of to the user. WebKit may freeze the media process well past the actual
   // suspension, so the window has to outlast the native ping schedule.
@@ -143,20 +130,13 @@
   let backgroundHoldWindowToken = 0;
   let backgroundHoldTimer = 0;
 
-  // Only a handover this bridge performed itself may be undone; a floating
-  // window the user opened stays under their control.
-  let pictureInPictureOwnedByBridge = false;
-
-  // Ownership is claimed when WebKit confirms the mode actually changed, not
-  // when the request was merely issued: `webkitSetPresentationMode` returns
-  // nothing and refuses silently, so a request that never landed used to leave
-  // the bridge convinced it owned a window that was not there.
-  let pictureInPictureRequested = false;
-  let pictureInPictureAttempts = 0;
-
   let foregroundRestoreToken = 0;
   let foregroundRestoreInProgress = false;
   let repaintAttempts = 0;
+
+  // Set when the video comes back from a fullscreen hand-out, so the first
+  // render probe forces one layout even if the frame count keeps advancing.
+  let pendingForegroundRepaint = false;
 
   let lastUserGestureAt = 0;
   let lastPauseAt = 0;
@@ -426,26 +406,6 @@
     }
   }
 
-  function enterPictureInPicture(video) {
-    allowPictureInPicture(video);
-
-    try {
-      if (typeof video.webkitSetPresentationMode === "function") {
-        video.webkitSetPresentationMode(PICTURE_IN_PICTURE);
-        return true;
-      }
-
-      if (typeof video.requestPictureInPicture === "function") {
-        ignoreRejection(video.requestPictureInPicture());
-        return true;
-      }
-    } catch (_) {
-      // WebKit refuses the transition while another one is still running.
-    }
-
-    return false;
-  }
-
   function setPresentationMode(video, mode) {
     try {
       if (mode === INLINE && document.pictureInPictureElement === video &&
@@ -522,65 +482,20 @@
       ignoreRejection(video.play());
     }
 
-    // A Picture in Picture request that WebKit dropped during the transition is
-    // retried for as long as the background hold keeps the process alive. A
-    // retry out of native fullscreen repeats the collision described in
-    // `prepareForBackground`, so the element is collapsed first there too.
-    if (
-      backgroundPresentationMode === FULLSCREEN &&
-      presentationModeOf(video) !== PICTURE_IN_PICTURE
-    ) {
-      if (nativePresentationModeOf(video) === FULLSCREEN) {
-        setPresentationMode(video, INLINE);
-      }
-
-      requestPictureInPicture(video, 0);
-    }
+    // Nothing else is done here. The bridge must not ask for Picture in
+    // Picture while the app resigns: a request made out of a live native
+    // fullscreen presentation makes `AVPlayerViewController` fight its own
+    // teardown (`exitFullScreenAnimated ... Invalid call`), which detaches the
+    // media layer and leaves the element flapping between inline and the
+    // floating window — black video over live audio once the app is back.
+    // WebKit performs the fullscreen→Picture in Picture handover itself on the
+    // home gesture; the bridge only keeps the audio alive here and hands the
+    // window back to inline on the way in.
 
     backgroundHoldTimer = window.setTimeout(
       holdBackgroundPlayback,
       backgroundHoldIntervalMilliseconds
     );
-  }
-
-  function requestPictureInPicture(video, attempt) {
-    if (appIsActive || !backgroundPlaybackIntended) {
-      return;
-    }
-
-    if (presentationModeOf(video) === PICTURE_IN_PICTURE) {
-      if (pictureInPictureRequested) {
-        pictureInPictureOwnedByBridge = true;
-      }
-
-      return;
-    }
-
-    if (pictureInPictureAttempts >= pictureInPictureAttemptLimit) {
-      if (pictureInPictureRequested) {
-        pictureInPictureRequested = false;
-        logToNative("picture-in-picture unavailable after " + pictureInPictureAttempts +
-          " attempts, keeping audio only");
-      }
-
-      return;
-    }
-
-    pictureInPictureAttempts += 1;
-    pictureInPictureRequested = true;
-
-    logToNative(
-      "picture-in-picture " + (enterPictureInPicture(video) ? "requested" : "rejected") +
-      " (attempt " + pictureInPictureAttempts + "), " + describeVideo(video)
-    );
-
-    if (attempt >= pictureInPictureRetryDelaysMilliseconds.length) {
-      return;
-    }
-
-    window.setTimeout(function () {
-      requestPictureInPicture(video, attempt + 1);
-    }, pictureInPictureRetryDelaysMilliseconds[attempt]);
   }
 
   // Called from willResignActive: the last moment at which WebKit still
@@ -603,22 +518,10 @@
     backgroundPlaybackIntended = Boolean(video) && !video.ended &&
       (!video.paused || suspendedByTransition);
 
-    // Ownership carries over while the element is still in the floating window
-    // this bridge opened. A locking device sends a spurious activation that
-    // cancels the trip mid-rollback, and dropping ownership there orphaned the
-    // window: nothing closed it on the way back, so the inline player stayed
-    // black while the picture kept going to the floating window. The
-    // presentation the user actually left is carried over with it.
-    const keepsOwnedFloatingWindow = pictureInPictureOwnedByBridge &&
-      presentationModeOf(video) === PICTURE_IN_PICTURE;
-
-    if (!keepsOwnedFloatingWindow) {
-      backgroundPresentationMode = backgroundPlaybackIntended ? presentationModeOf(video) : INLINE;
-    }
-
-    pictureInPictureOwnedByBridge = keepsOwnedFloatingWindow;
-    pictureInPictureRequested = keepsOwnedFloatingWindow;
-    pictureInPictureAttempts = 0;
+    // The presentation the user actually left is what the trip is handed over
+    // from. A floating window the user opened keeps being reported as such, so
+    // on the way back it is left under their control rather than closed.
+    backgroundPresentationMode = backgroundPlaybackIntended ? presentationModeOf(video) : INLINE;
     backgroundTransitionAt = Date.now();
     repaintAttempts = 0;
 
@@ -645,18 +548,20 @@
       ignoreRejection(video.play());
     }
 
-    // Fullscreen playback continues as a floating window. Inline playback is
+    // Fullscreen playback continues as a floating window; inline playback is
     // only meant to keep its audio, so its presentation is left untouched.
     //
-    // Collapsing native fullscreen before the request was tried and is worse
-    // on both ends: WebKit silently refuses a Picture in Picture request made
-    // from plain inline with no user gesture behind it, so the window never
-    // appears at all, while a request made straight out of fullscreen is
-    // honoured — and the fullscreen teardown rumbling underneath it is the
-    // same transition WebKit performs for its own automatic handover.
-    if (backgroundPresentationMode === FULLSCREEN) {
-      requestPictureInPicture(video, 0);
-    }
+    // The bridge deliberately does not ask for Picture in Picture here. A
+    // request made straight out of the live fullscreen presentation makes
+    // `AVPlayerViewController` fight its own teardown — the `Invalid call` of
+    // `exitFullScreenAnimated` the log shows — which detaches the media layer
+    // and leaves the element flapping between inline and the floating window:
+    // black video over live audio once the app is back. WebKit performs the
+    // fullscreen→Picture in Picture handover itself when the home gesture
+    // backgrounds the app; the bridge only keeps the audio alive in the hold
+    // and hands the window back to inline on the way in. The element is left
+    // exactly as the user left it, so a window WebKit has already switched it
+    // into keeps playing rather than being read as a user pause.
 
     reportPlaybackState();
   }
@@ -753,6 +658,24 @@
     if (!video.isConnected || video.paused || video.ended || repaintAttempts >= repaintAttemptLimit) {
       finishForegroundRestore(restoreToken);
       return;
+    }
+
+    // Leaving the floating window after a fullscreen hand-out is the transition
+    // WebKit lands with a detached media layer: the element keeps decoding and
+    // feeding audio but never paints, so the stall check below never sees the
+    // frame count stall and would let the black surface stand. One forced
+    // layout up front hands it a fresh rendering surface before the check
+    // decides anything.
+    if (pendingForegroundRepaint) {
+      pendingForegroundRepaint = false;
+      repaintAttempts += 1;
+      logToNative("repaint after fullscreen hand-out");
+      repaintVideo(video);
+
+      if (repaintAttempts >= repaintAttemptLimit) {
+        finishForegroundRestore(restoreToken);
+        return;
+      }
     }
 
     const framesBefore = decodedFrameCount(video);
@@ -889,6 +812,7 @@
     const restoreToken = ++foregroundRestoreToken;
     foregroundRestoreInProgress = true;
     repaintAttempts = 0;
+    pendingForegroundRepaint = false;
 
     const video = pickActiveVideo();
     activeVideo = video;
@@ -899,30 +823,50 @@
       return;
     }
 
-    // Ownership must not gate the way back. Fullscreen video backgrounded by
-    // the home gesture is handed into the floating window by WebKit itself, so
-    // the bridge never owns that window (`pictureInPictureRequested` stayed
-    // false); gating on ownership skipped the exit entirely and returned to an
+    // Fullscreen video backgrounded by the home gesture is handed into the
+    // floating window by WebKit itself, so the bridge never asked for that
+    // window; gating on ownership skipped the exit entirely and returned to an
     // element whose inline layer was gone — audio kept playing over a black
-    // surface. Anything still presenting as Picture in Picture comes back.
+    // surface.
+    //
+    // What separates the two cases is the presentation the element left in. A
+    // window that arrived while the video was in fullscreen is the handoff and
+    // comes back, so the inline player can render again. A window the user
+    // opened from inline playback is theirs and stays theirs.
     const leavingPictureInPicture =
       presentationModeOf(video) === PICTURE_IN_PICTURE;
     const targetMode = restorePresentationMode();
-
-    pictureInPictureOwnedByBridge = false;
-    pictureInPictureRequested = false;
+    const windowIsAHandoff =
+      leavingPictureInPicture && backgroundPresentationMode === FULLSCREEN;
 
     logToNative(
       "recoverAfterForeground: leavingPiP=" + leavingPictureInPicture +
-      " target=" + targetMode + ", " + describeVideo(video)
+      " handoff=" + windowIsAHandoff + " target=" + targetMode +
+      ", " + describeVideo(video)
     );
 
     if (!leavingPictureInPicture) {
+      // Not in a floating window at all: revive playback and watch for the
+      // detached surface.
       resumeAfterForeground(video, restoreToken);
       return;
     }
 
+    if (!windowIsAHandoff) {
+      // The user's own floating window. Forcing it back inline is not the
+      // bridge's place, but the app's suspension paused the element, so
+      // playback is revived and the window is left under the user's control.
+      // The presentation is deliberately not touched here.
+      if (backgroundPlaybackIntended && video.paused && !video.ended) {
+        ignoreRejection(video.play());
+      }
+      backgroundPlaybackIntended = false;
+      finishForegroundRestore(restoreToken);
+      return;
+    }
+
     setPresentationMode(video, targetMode);
+    pendingForegroundRepaint = true;
     waitForPresentation(video, targetMode, restoreToken, 0);
   }
 
@@ -932,20 +876,11 @@
     appIsActive = true;
     closeBackgroundHoldWindow();
 
-    const video = activeVideo;
-    const targetMode = restorePresentationMode();
-
     backgroundPlaybackIntended = false;
 
-    // Ownership is deliberately not cleared here. Leaving the floating window
-    // is asynchronous and a locking device abandons the rollback half way;
-    // clearing it at this point orphaned a window this bridge had opened. The
-    // presentation change event clears it once the element is actually out.
-    if (pictureInPictureOwnedByBridge && video &&
-      presentationModeOf(video) === PICTURE_IN_PICTURE) {
-      setPresentationMode(video, targetMode);
-    }
-
+    // The bridge never opened a window, so there is nothing here to roll back;
+    // a window that exists is the user's or WebKit's own handover and is left
+    // as it is.
     reportPlaybackState();
   }
 
@@ -1024,19 +959,7 @@
       return;
     }
 
-    if (presentationModeOf(video) === PICTURE_IN_PICTURE) {
-      // WebKit confirmed the handover, so the bridge may undo it on the way
-      // back. A window the user opened never sets `pictureInPictureRequested`
-      // and therefore stays theirs.
-      if (pictureInPictureRequested) {
-        pictureInPictureOwnedByBridge = true;
-      }
-    } else {
-      pictureInPictureOwnedByBridge = false;
-    }
-
-    logToNative("presentation changed: " + describeVideo(video) +
-      " owned=" + pictureInPictureOwnedByBridge);
+    logToNative("presentation changed: " + describeVideo(video));
     reportPlaybackState();
   }
 
