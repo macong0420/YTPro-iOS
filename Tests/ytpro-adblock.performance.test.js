@@ -31,6 +31,7 @@ class FakeElement {
     this.parentElement = null;
     this.isConnected = false;
     this.dataset = {};
+    this.attributes = new Map();
     this.queryCount = 0;
     this.clickCount = 0;
     this.playCount = 0;
@@ -39,6 +40,7 @@ class FakeElement {
     this.paused = true;
     this.ended = false;
     this.currentTime = 0;
+    this.duration = Number.NaN;
     this.decodedFrames = 0;
     this.repaintCount = 0;
     this.webkitPresentationMode = "inline";
@@ -46,13 +48,18 @@ class FakeElement {
     this.disablePictureInPicture = true;
     this.rect = { width: 320, height: 180 };
     this.styleValues = new Map();
+    this.stylePriorities = new Map();
     this.style = {
-      setProperty: (name, value) => {
+      setProperty: (name, value, priority = "") => {
         this.styleValues.set(name, value);
+        this.stylePriorities.set(name, priority);
       },
       removeProperty: (name) => {
         this.styleValues.delete(name);
+        this.stylePriorities.delete(name);
       },
+      getPropertyValue: (name) => this.styleValues.get(name) || "",
+      getPropertyPriority: (name) => this.stylePriorities.get(name) || "",
       get display() {
         return "";
       }
@@ -128,7 +135,23 @@ class FakeElement {
     }
   }
 
-  setAttribute() {
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+
+  remove() {
+    if (!this.parentElement) {
+      return;
+    }
+
+    const index = this.parentElement.children.indexOf(this);
+
+    if (index >= 0) {
+      this.parentElement.children.splice(index, 1);
+    }
+
+    this.parentElement = null;
+    this.setConnected(false);
   }
 
   webkitSetPresentationMode(mode) {
@@ -163,6 +186,10 @@ class FakeDocument {
     this.pictureInPictureEnabled = false;
     this.queryCount = 0;
     this.listeners = new Map();
+  }
+
+  createElement(tagName) {
+    return new FakeElement(tagName);
   }
 
   querySelectorAll(selector) {
@@ -201,7 +228,7 @@ function collectMatches(elements, selector) {
   return matches;
 }
 
-function createHarness() {
+function createHarness(options = {}) {
   const documentRoot = new FakeElement("html");
   documentRoot.setConnected(true);
   const document = new FakeDocument(documentRoot);
@@ -222,6 +249,8 @@ function createHarness() {
 
   const window = {
     location: { hostname: "m.youtube.com" },
+    fetch: options.fetch,
+    ytInitialPlayerResponse: options.initialPlayerResponse,
     innerWidth: 390,
     innerHeight: 844,
     webkit: {
@@ -356,7 +385,7 @@ test("skip buttons are handled incrementally and full scans are low-frequency fa
   assert.equal(harness.document.queryCount, initialDocumentQueries, "added nodes must not trigger a document scan");
   assert.equal(harness.intervals.length, 3);
   assert.equal(harness.intervals[0].delay, 5000);
-  assert.equal(harness.intervals[1].delay, 1000);
+  assert.equal(harness.intervals[1].delay, 250);
   assert.equal(harness.intervals[2].delay, 1000);
 
   harness.intervals[0].callback();
@@ -364,6 +393,251 @@ test("skip buttons are handled incrementally and full scans are low-frequency fa
 
   harness.intervals[1].callback();
   assert.equal(skipButton.clickCount, 2, "the skip poll clicks buttons that appeared without a mutation");
+});
+
+test("initial player responses are stripped before YouTube can schedule ads", () => {
+  const initialPlayerResponse = {
+    adPlacements: [{ adPlacementRenderer: {} }],
+    playerAds: [{ playerLegacyDesktopWatchAdsRenderer: {} }],
+    adSlots: [{ adSlotRenderer: {} }],
+    videoDetails: { videoId: "content-video" },
+    nested: {
+      adBreakHeartbeatParams: "ad-heartbeat",
+      keep: true
+    }
+  };
+  const harness = createHarness({ initialPlayerResponse });
+
+  assert.equal("adPlacements" in harness.window.ytInitialPlayerResponse, false);
+  assert.equal("playerAds" in harness.window.ytInitialPlayerResponse, false);
+  assert.equal("adSlots" in harness.window.ytInitialPlayerResponse, false);
+  assert.equal("adBreakHeartbeatParams" in harness.window.ytInitialPlayerResponse.nested, false);
+  assert.equal(harness.window.ytInitialPlayerResponse.videoDetails.videoId, "content-video");
+  assert.equal(harness.window.ytInitialPlayerResponse.nested.keep, true);
+  assert.ok(
+    harness.nativeMessages.some((message) => message.type === "log" && message.message.includes("stripped player response"))
+  );
+});
+
+test("fetch player responses are stripped without delaying the content response", async () => {
+  const source = {
+    adPlacements: [{ adPlacementRenderer: {} }],
+    playerAds: [{}],
+    streamingData: { formats: [{ itag: 18 }] },
+    videoDetails: { videoId: "content-video" }
+  };
+  const response = {
+    json() {
+      return Promise.resolve(JSON.parse(JSON.stringify(source)));
+    },
+    text() {
+      return Promise.resolve(JSON.stringify(source));
+    },
+    clone() {
+      return this;
+    }
+  };
+  const harness = createHarness({
+    fetch() {
+      return Promise.resolve(response);
+    }
+  });
+
+  const playerResponse = await harness.window
+    .fetch("https://m.youtube.com/youtubei/v1/player?prettyPrint=false")
+    .then((result) => result.json());
+
+  assert.equal("adPlacements" in playerResponse, false);
+  assert.equal("playerAds" in playerResponse, false);
+  assert.deepEqual(playerResponse.streamingData.formats, [{ itag: 18 }]);
+  assert.equal(playerResponse.videoDetails.videoId, "content-video");
+});
+
+test("non-player fetch responses pass through untouched", async () => {
+  const source = { adPlacements: ["not-a-player-response"], keep: true };
+  const response = {
+    json() {
+      return Promise.resolve(source);
+    }
+  };
+  const harness = createHarness({
+    fetch() {
+      return Promise.resolve(response);
+    }
+  });
+
+  const result = await harness.window
+    .fetch("https://m.youtube.com/youtubei/v1/search")
+    .then((value) => value.json());
+
+  assert.deepEqual(result.adPlacements, ["not-a-player-response"]);
+  assert.equal(result.keep, true);
+});
+
+test("the DOM fallback advances a confirmed in-stream pre-roll", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.duration = 6.041;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.currentTime, 6.041);
+  assert.equal(video.styleValues.get("opacity"), undefined, "the fallback must not replace ads with a black shield");
+  assert.ok(
+    harness.nativeMessages.some((message) => message.type === "log" && message.message.startsWith("ad: advanced"))
+  );
+});
+
+test("an ad is retried while its duration is initially unavailable", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", ["#movie_player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-module"]);
+  const video = new FakeElement("video");
+
+  video.currentTime = 8;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.currentTime, 8);
+  assert.ok(
+    harness.nativeMessages.some((message) => message.type === "log" && message.message.includes("duration-unavailable"))
+  );
+
+  video.duration = 30;
+  harness.intervals[1].callback();
+
+  assert.equal(video.currentTime, 30, "the 250ms poll should finish the previously unseekable ad");
+});
+
+test("ordinary, long and live media are never force-seeked", () => {
+  const harness = createHarness();
+  const ordinaryPlayer = new FakeElement("div", [".html5-video-player"]);
+  const ordinaryVideo = new FakeElement("video");
+
+  ordinaryVideo.duration = 60;
+  ordinaryVideo.currentTime = 12;
+  ordinaryVideo.paused = false;
+  harness.documentRoot.append(ordinaryPlayer);
+  ordinaryPlayer.append(ordinaryVideo);
+
+  harness.mutationCallback([{ type: "attributes", target: ordinaryPlayer }]);
+  runNextTimeout(harness, 0);
+  assert.equal(ordinaryVideo.currentTime, 12);
+  assert.equal(ordinaryVideo.styleValues.get("opacity"), undefined);
+
+  const adPlayer = new FakeElement("div", ["ytm-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-text"]);
+  const longVideo = new FakeElement("video");
+
+  longVideo.duration = 600;
+  longVideo.currentTime = 1;
+  longVideo.paused = false;
+  harness.documentRoot.append(adPlayer);
+  adPlayer.append(adEvidence);
+  adPlayer.append(longVideo);
+
+  harness.mutationCallback([{ type: "attributes", target: adPlayer }]);
+  runNextTimeout(harness, 0);
+  assert.equal(longVideo.currentTime, 1);
+
+  longVideo.duration = Number.POSITIVE_INFINITY;
+  harness.intervals[1].callback();
+  assert.equal(longVideo.currentTime, 1);
+});
+
+test("only the actively playing ad video is advanced", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", ["ytm-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-preview-container"]);
+  const contentVideo = new FakeElement("video");
+  const adVideo = new FakeElement("video");
+
+  contentVideo.duration = 600;
+  contentVideo.currentTime = 12;
+  adVideo.duration = 20;
+  adVideo.currentTime = 2;
+  adVideo.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(contentVideo);
+  player.append(adVideo);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(contentVideo.currentTime, 12);
+  assert.equal(adVideo.currentTime, 20);
+});
+
+test("ad-interrupting is not sufficient evidence for forced seeking", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-interrupting"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-player-overlay"]);
+  const video = new FakeElement("video");
+
+  video.duration = 30;
+  video.currentTime = 1;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.currentTime, 1);
+  assert.equal(video.styleValues.get("opacity"), undefined);
+});
+
+test("mobile skip-slot controls are clicked", () => {
+  const harness = createHarness();
+  const skipButton = new FakeElement("button", [".ytp-ad-skip-button-slot button"]);
+  const video = new FakeElement("video");
+
+  harness.documentRoot.append(skipButton);
+  harness.documentRoot.append(video);
+  harness.mutationCallback([{ addedNodes: [skipButton] }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(skipButton.clickCount, 1);
+});
+
+test("forced ad seeking is disabled while backgrounding", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.duration = 15;
+  video.currentTime = 1;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ addedNodes: [player] }]);
+  runNextTimeout(harness, 0);
+  video.dispatch("playing");
+  harness.window.__ytproPrepareForBackground();
+
+  player.selectors.add(".html5-video-player.ad-showing");
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runTimeouts(harness, 0);
+
+  assert.equal(video.currentTime, 1);
 });
 
 test("the native side drives one background handover and one foreground restore", () => {

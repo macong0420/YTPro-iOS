@@ -50,8 +50,45 @@
     ".ytp-ad-overlay-close-button",
     ".ytp-ad-skip-button",
     ".ytp-ad-skip-button-modern",
-    ".ytp-skip-ad-button"
+    ".ytp-skip-ad-button",
+    ".ytp-ad-skip-button-slot button",
+    ".ytp-ad-skip-button-container button"
   ];
+
+  // YouTube reuses the requested video's media element for pre-rolls. Hiding
+  // the controls alone therefore leaves the actual ad playing. `ad-showing` is
+  // the stable player state; `ad-interrupting` is deliberately excluded from
+  // forced seeking because it can appear before the media source has switched.
+  const seekableAdPlayerSelectors = [
+    ".html5-video-player.ad-showing",
+    "#movie_player.ad-showing",
+    "ytm-player.ad-showing"
+  ];
+
+  const inStreamAdEvidenceSelectors = [
+    ".video-ads",
+    ".ytp-ad-module",
+    ".ytp-ad-duration-remaining",
+    ".ytp-ad-preview-container",
+    ".ytp-ad-preview-text",
+    ".ytp-ad-simple-ad-badge",
+    ".ytp-ad-message-container",
+    ".ytp-ad-text",
+    ".ytp-ad-text-overlay",
+    ".ytp-ad-player-overlay",
+    ".ytp-ad-player-overlay-layout",
+    ".ytp-ad-player-overlay-instream-info",
+    ".ytp-ad-skip-button-container",
+    ".ytp-ad-skip-button-slot"
+  ];
+
+  const maximumForcedAdDurationSeconds = 120;
+  const playerAdResponseKeys = new Set([
+    "adPlacements",
+    "playerAds",
+    "adSlots",
+    "adBreakHeartbeatParams"
+  ]);
 
   // WebKit only reports "fullscreen" for the native video presentation. The
   // YouTube players frequently drive their own CSS fullscreen layout instead,
@@ -66,8 +103,8 @@
   const FULLSCREEN = "fullscreen";
   const PICTURE_IN_PICTURE = "picture-in-picture";
 
-  // Child-list mutations are handled incrementally. This slower full scan is a
-  // recovery path for selector changes caused only by class/attribute updates.
+  // Child-list and ad-revealing attribute changes are handled incrementally.
+  // This slower full scan remains a recovery path for anything still missed.
   const fallbackScanIntervalMilliseconds = 5000;
 
   // How long a pause is still attributed to the background transition instead
@@ -146,6 +183,9 @@
   // however long the video has been running.
   let lastPlayingObservedAt = 0;
 
+  let lastAdDiagnosticKey = "";
+  let lastAdDiagnosticAt = 0;
+
   function noteUserGesture() {
     lastUserGestureAt = Date.now();
   }
@@ -197,6 +237,26 @@
 
   function logToNative(message) {
     postToNative({ type: "log", message: String(message) });
+  }
+
+  function logAdDiagnostic(reason, video) {
+    const duration = video ? Number(video.duration) : -1;
+    const currentTime = video ? Number(video.currentTime) : -1;
+    const key = reason + ":" + duration + ":" + (video ? video.paused : "none");
+    const now = Date.now();
+
+    if (key === lastAdDiagnosticKey && now - lastAdDiagnosticAt < 2000) {
+      return;
+    }
+
+    lastAdDiagnosticKey = key;
+    lastAdDiagnosticAt = now;
+    logToNative(
+      "ad: waiting reason=" + reason +
+      " paused=" + (video ? video.paused : "none") +
+      " duration=" + duration +
+      " t=" + currentTime
+    );
   }
 
   function reportPlaybackState() {
@@ -262,6 +322,282 @@
     }
   }
 
+  function stripAdsFromPlayerResponse(value, seen) {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    if (seen.has(value)) {
+      return false;
+    }
+
+    seen.add(value);
+    let changed = false;
+
+    for (const key of Object.keys(value)) {
+      if (playerAdResponseKeys.has(key)) {
+        try {
+          delete value[key];
+          changed = true;
+        } catch (_) {
+          // Frozen response objects are left to the DOM fallback.
+        }
+        continue;
+      }
+
+      if (stripAdsFromPlayerResponse(value[key], seen)) {
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  function sanitizePlayerResponse(data, source) {
+    const changed = stripAdsFromPlayerResponse(data, new Set());
+
+    if (changed) {
+      logToNative("ad: stripped player response from " + source);
+    }
+
+    return data;
+  }
+
+  function sanitizePlayerResponseText(text, source) {
+    try {
+      const data = JSON.parse(text);
+      sanitizePlayerResponse(data, source);
+      return JSON.stringify(data);
+    } catch (_) {
+      return text;
+    }
+  }
+
+  function playerRequestURL(input) {
+    if (typeof input === "string") {
+      return input;
+    }
+
+    return input && typeof input.url === "string" ? input.url : "";
+  }
+
+  function isPlayerResponseRequest(url) {
+    return url.includes("/youtubei/v1/player");
+  }
+
+  function wrapPlayerFetchResponse(response) {
+    if (!response || typeof Proxy !== "function") {
+      return response;
+    }
+
+    return new Proxy(response, {
+      get: function (target, property) {
+        if (property === "json") {
+          return function () {
+            return target.json().then(function (data) {
+              return sanitizePlayerResponse(data, "fetch.json");
+            });
+          };
+        }
+
+        if (property === "text") {
+          return function () {
+            return target.text().then(function (text) {
+              return sanitizePlayerResponseText(text, "fetch.text");
+            });
+          };
+        }
+
+        if (property === "clone") {
+          return function () {
+            return wrapPlayerFetchResponse(target.clone());
+          };
+        }
+
+        const value = target[property];
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+  }
+
+  function installPlayerFetchPatch() {
+    if (typeof window.fetch !== "function" || window.fetch.__ytproPatched === true) {
+      return;
+    }
+
+    const originalFetch = window.fetch;
+
+    function patchedFetch() {
+      const requestURL = playerRequestURL(arguments[0]);
+      const result = originalFetch.apply(this, arguments);
+
+      if (!isPlayerResponseRequest(requestURL) || !result || typeof result.then !== "function") {
+        return result;
+      }
+
+      return result.then(wrapPlayerFetchResponse);
+    }
+
+    patchedFetch.__ytproPatched = true;
+    window.fetch = patchedFetch;
+  }
+
+  function installInitialPlayerResponsePatch() {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(window, "ytInitialPlayerResponse");
+
+      if (descriptor && descriptor.configurable === false) {
+        sanitizePlayerResponse(window.ytInitialPlayerResponse, "initial-existing");
+        return;
+      }
+
+      let playerResponse = sanitizePlayerResponse(
+        window.ytInitialPlayerResponse,
+        "initial-existing"
+      );
+
+      Object.defineProperty(window, "ytInitialPlayerResponse", {
+        configurable: true,
+        enumerable: true,
+        get: function () {
+          return playerResponse;
+        },
+        set: function (value) {
+          playerResponse = sanitizePlayerResponse(value, "initial-assignment");
+        }
+      });
+    } catch (_) {
+      // Some YouTube builds own a sealed global; fetch remains the main path.
+    }
+  }
+
+  function sanitizeKnownPlayerGlobals() {
+    sanitizePlayerResponse(window.ytInitialPlayerResponse, "initial-poll");
+
+    try {
+      const args = window.ytplayer && window.ytplayer.config && window.ytplayer.config.args;
+
+      if (args && typeof args.player_response === "string") {
+        args.player_response = sanitizePlayerResponseText(
+          args.player_response,
+          "ytplayer.config"
+        );
+      }
+    } catch (_) {
+      // Legacy config is absent on most mobile player builds.
+    }
+  }
+
+  function installPlayerResponsePatches() {
+    installPlayerFetchPatch();
+    installInitialPlayerResponsePatch();
+    sanitizeKnownPlayerGlobals();
+  }
+
+  function clickSkipControls(scope) {
+    for (const selector of clickableSelectors) {
+      forEachMatchingElement(scope, selector, function (button) {
+        button.click();
+      });
+    }
+  }
+
+  function hasInStreamAdEvidence(player) {
+    for (const selector of inStreamAdEvidenceSelectors) {
+      try {
+        if (player.querySelectorAll(selector).length > 0) {
+          return true;
+        }
+      } catch (_) {
+        // Keep trying selector variants supported by this WebKit.
+      }
+    }
+
+    return false;
+  }
+
+  function finishInStreamAd(player) {
+    if (!hasInStreamAdEvidence(player)) {
+      logAdDiagnostic("no-ui-evidence", null);
+      return;
+    }
+
+    let videos = [];
+
+    try {
+      videos = Array.from(player.querySelectorAll("video"));
+    } catch (_) {
+      return;
+    }
+
+    // Preview/content elements may coexist with the ad media. Only the active
+    // element is shielded and advanced.
+    const video = videos.find(function (candidate) {
+      return !candidate.paused && !candidate.ended;
+    });
+
+    if (!video) {
+      if (!videos.some(function (candidate) { return candidate.ended; })) {
+        logAdDiagnostic("no-playing-video", videos[0] || null);
+      }
+      return;
+    }
+
+    const duration = Number(video.duration);
+    const currentTime = Number(video.currentTime);
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      logAdDiagnostic("duration-unavailable", video);
+      return;
+    }
+
+    if (duration > maximumForcedAdDurationSeconds) {
+      logAdDiagnostic("duration-too-long", video);
+      return;
+    }
+
+    if (!Number.isFinite(currentTime) || currentTime < 0) {
+      logAdDiagnostic("clock-unavailable", video);
+      return;
+    }
+
+    if (duration - currentTime <= 0.1) {
+      return;
+    }
+
+    try {
+      video.currentTime = duration;
+      logToNative(
+        "ad: advanced in-stream media from " + Math.round(currentTime * 10) / 10 +
+        "s to " + Math.round(duration * 10) / 10 + "s"
+      );
+    } catch (_) {
+      logAdDiagnostic("seek-rejected", video);
+    }
+  }
+
+  function finishInStreamAds(root) {
+    // Ending an ad can emit `ended` on the shared media element before YouTube
+    // switches it to content. Doing that while backgrounded would clear the
+    // lifecycle bridge's playback intent, so forced seeking is foreground-only.
+    if (!appIsActive) {
+      return;
+    }
+
+    const scope = root && root.querySelectorAll ? root : document;
+    const players = new Set();
+
+    for (const selector of seekableAdPlayerSelectors) {
+      forEachMatchingElement(scope, selector, function (player) {
+        players.add(player);
+      });
+    }
+
+    for (const player of players) {
+      finishInStreamAd(player);
+    }
+  }
+
   function cleanAds(root) {
     const scope = root && root.querySelectorAll ? root : document;
 
@@ -269,11 +605,8 @@
       forEachMatchingElement(scope, selector, hideElement);
     }
 
-    for (const selector of clickableSelectors) {
-      forEachMatchingElement(scope, selector, function (button) {
-        button.click();
-      });
-    }
+    clickSkipControls(scope);
+    finishInStreamAds(scope);
   }
 
   function trackedVideos() {
@@ -1088,11 +1421,27 @@
     window.setTimeout(flushIncrementalScan, 0);
   }
 
+  // Install before DOM readiness so YouTube never receives ad scheduling data
+  // for the initial player or later SPA navigations.
+  installPlayerResponsePatches();
   installLifecycleBridge();
   installVisibilityPatch();
 
   const observer = new MutationObserver(function (mutations) {
     for (const mutation of mutations) {
+      // YouTube commonly reuses a player and reveals the ad only by toggling
+      // its class. Without attribute observation the pre-roll is missed until
+      // the slow fallback scan.
+      if (mutation.type === "attributes") {
+        const target = mutation.target;
+
+        if (target && target.nodeType === Node.ELEMENT_NODE) {
+          scheduleIncrementalScan(target);
+        }
+
+        continue;
+      }
+
       for (const node of mutation.addedNodes) {
         if (node.nodeType === Node.ELEMENT_NODE) {
           scheduleIncrementalScan(node);
@@ -1101,21 +1450,20 @@
     }
   });
 
-  const adSkipPollIntervalMilliseconds = 1000;
+  const adSkipPollIntervalMilliseconds = 250;
 
-  // In-stream video ads render inside the player itself, so hiding alone is
-  // not enough — the skip button has to be clicked as soon as it exists. A one
-  // second poll closes the gap between the five second fallback scans.
+  // The fast poll retries ads whose duration is still NaN during the first
+  // mutation callback and handles skip controls created without a usable
+  // mutation record.
   function clickAdSkipButtons() {
-    if (appIsActive && observedVideos.size === 0) {
+    sanitizeKnownPlayerGlobals();
+
+    if (appIsActive && !document.querySelector("video")) {
       return;
     }
 
-    for (const selector of clickableSelectors) {
-      forEachMatchingElement(document, selector, function (button) {
-        button.click();
-      });
-    }
+    clickSkipControls(document);
+    finishInStreamAds(document);
   }
 
   function start() {
@@ -1127,7 +1475,8 @@
 
     observer.observe(document.documentElement || document.body, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributeFilter: ["class", "style", "id", "layout"]
     });
     window.setInterval(scanDocument, fallbackScanIntervalMilliseconds);
     window.setInterval(clickAdSkipButtons, adSkipPollIntervalMilliseconds);
