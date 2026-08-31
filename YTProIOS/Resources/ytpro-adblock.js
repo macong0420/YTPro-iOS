@@ -65,9 +65,10 @@
     "ytm-player.ad-showing"
   ];
 
-  const inStreamAdEvidenceSelectors = [
-    ".video-ads",
-    ".ytp-ad-module",
+  // On screen only while an ad is actually running: its countdown, its preview
+  // timer, its badge, its skip control. Nothing else in the player produces
+  // these, so a player showing one is playing an ad whatever its length claims.
+  const liveAdEvidenceSelectors = [
     ".ytp-ad-duration-remaining",
     ".ytp-ad-preview-container",
     ".ytp-ad-preview-text",
@@ -82,7 +83,22 @@
     ".ytp-ad-skip-button-slot"
   ];
 
+  // Containers YouTube keeps in the player whether or not an ad is running.
+  // Treating these as evidence is what made every detection weak, and a weak
+  // detection is why the length cap below had to be the only real guard.
+  const persistentAdContainerSelectors = [
+    ".video-ads",
+    ".ytp-ad-module"
+  ];
+
   const maximumForcedAdDurationSeconds = 120;
+
+  // Seeking to the end of an ad is refused whenever the media source has not
+  // buffered that far, and the ad then plays out in full. Muting it and running
+  // the clock as fast as the element allows costs the user a second or two of
+  // silence instead of the whole break.
+  const forcedAdPlaybackRate = 16;
+
   const playerAdResponseKeys = new Set([
     "adPlacements",
     "playerAds",
@@ -112,6 +128,7 @@
   // suspension, so the window has to outlast the native ping schedule.
   const backgroundHoldWindowMilliseconds = 15000;
   const backgroundHoldIntervalMilliseconds = 250;
+  const backgroundHoldReportIntervalMilliseconds = 1000;
 
   // Leaving the floating window is asynchronous; playback only resumes once
   // the element is inline again.
@@ -132,6 +149,12 @@
   const driftResumeRetryDelayMilliseconds = 300;
 
   const playbackSyncIntervalMilliseconds = 1000;
+
+  // WebKit silently drops a presentation request made while another transition
+  // is still in flight (`HTMLVideoElement::webkitSetPresentationMode` returns
+  // early on `isChangingVideoFullscreenMode`), and the page cannot read that
+  // flag, so recency of the last change stands in for it.
+  const presentationSettleMilliseconds = 700;
 
   // The bridge announcing the background trip runs through `evaluateJavaScript`
   // and the web process is already throttled by the time the app resigns
@@ -183,8 +206,22 @@
   // however long the video has been running.
   let lastPlayingObservedAt = 0;
 
+  let lastBackgroundHoldReportAt = 0;
+
+  // Whether the floating window currently open is one the bridge asked for. A
+  // window the user opened is theirs to keep; one opened for a background trip
+  // has to be handed back when that trip ends.
+  let bridgeOpenedPictureInPicture = false;
+  let lastPresentationChangeAt = 0;
+
   let lastAdDiagnosticKey = "";
   let lastAdDiagnosticAt = 0;
+
+  // The ad and the content share one media element, so whatever is forced on it
+  // for the break has to be handed back exactly as it was found.
+  let shieldedAdVideo = null;
+  let shieldedAdMuted = false;
+  let shieldedAdPlaybackRate = 1;
 
   function noteUserGesture() {
     lastUserGestureAt = Date.now();
@@ -363,14 +400,37 @@
     return data;
   }
 
-  function sanitizePlayerResponseText(text, source) {
+  // Captured before the patch below replaces the global, so the bridge's own
+  // parsing never re-enters its own interception.
+  const nativeJSONParse = JSON.parse;
+
+  // `null` when the payload carried no ad scheduling, so callers can leave the
+  // original body in place instead of round-tripping it through JSON.
+  function strippedPlayerResponseText(text, source) {
+    let data;
+
     try {
-      const data = JSON.parse(text);
-      sanitizePlayerResponse(data, source);
+      data = nativeJSONParse(text);
+    } catch (_) {
+      return null;
+    }
+
+    if (!stripAdsFromPlayerResponse(data, new Set())) {
+      return null;
+    }
+
+    logToNative("ad: stripped player response from " + source);
+
+    try {
       return JSON.stringify(data);
     } catch (_) {
-      return text;
+      return null;
     }
+  }
+
+  function sanitizePlayerResponseText(text, source) {
+    const stripped = strippedPlayerResponseText(text, source);
+    return stripped === null ? text : stripped;
   }
 
   function playerRequestURL(input) {
@@ -383,6 +443,32 @@
 
   function isPlayerResponseRequest(url) {
     return url.includes("/youtubei/v1/player");
+  }
+
+  // The page parses a great deal of JSON that has nothing to do with playback.
+  // These keys are what a player response always carries, and checking for them
+  // is a handful of property lookups against a full recursive walk.
+  const playerResponseMarkerKeys = [
+    "adPlacements",
+    "playerAds",
+    "adSlots",
+    "streamingData",
+    "playabilityStatus",
+    "videoDetails"
+  ];
+
+  function looksLikePlayerResponse(value) {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    for (const key of playerResponseMarkerKeys) {
+      if (key in value) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function wrapPlayerFetchResponse(response) {
@@ -435,11 +521,128 @@
         return result;
       }
 
+      // One line per player load. An ad the DOM fallback later has to catch is
+      // only explicable if the response it came from was never seen here, so
+      // the interception itself has to be visible, not just its hits.
+      logToNative("ad: intercepting player response over fetch");
+
       return result.then(wrapPlayerFetchResponse);
     }
 
     patchedFetch.__ytproPatched = true;
     window.fetch = patchedFetch;
+  }
+
+  // The mobile player issues a large share of its `youtubei` calls through
+  // `XMLHttpRequest` rather than `fetch`, so patching `fetch` alone left the
+  // pre-roll scheduling of those loads intact.
+  function sanitizePlayerXHR(request) {
+    if (request.readyState !== 4) {
+      return;
+    }
+
+    const responseType = request.responseType;
+
+    // A parsed JSON response is created once and handed to every reader, so
+    // editing it in place is enough.
+    if (responseType === "json") {
+      const data = request.response;
+
+      if (data && typeof data === "object") {
+        sanitizePlayerResponse(data, "xhr.json");
+      }
+
+      return;
+    }
+
+    if (responseType !== "" && responseType !== "text") {
+      return;
+    }
+
+    const text = request.responseText;
+
+    if (typeof text !== "string" || text.length === 0) {
+      return;
+    }
+
+    const stripped = strippedPlayerResponseText(text, "xhr.text");
+
+    if (stripped === null) {
+      return;
+    }
+
+    // Shadowing the prototype accessors is the only way to hand the player a
+    // body it never received.
+    Object.defineProperty(request, "responseText", {
+      configurable: true,
+      get: function () {
+        return stripped;
+      }
+    });
+
+    Object.defineProperty(request, "response", {
+      configurable: true,
+      get: function () {
+        return stripped;
+      }
+    });
+  }
+
+  function installPlayerXHRPatch() {
+    const requestConstructor = window.XMLHttpRequest;
+
+    if (typeof requestConstructor !== "function" || requestConstructor.__ytproPatched === true) {
+      return;
+    }
+
+    const prototype = requestConstructor.prototype;
+    const originalOpen = prototype && prototype.open;
+
+    if (typeof originalOpen !== "function") {
+      return;
+    }
+
+    prototype.open = function (method, url) {
+      // A reused request still carries the accessors installed for its previous
+      // response, which would hand the player a stale body.
+      try {
+        delete this.responseText;
+        delete this.response;
+      } catch (_) {
+        // Nothing was shadowed on this request.
+      }
+
+      this.__ytproIsPlayerRequest = isPlayerResponseRequest(String(url == null ? "" : url));
+
+      // Registered here rather than from `send` so the listener precedes the
+      // player's own handlers: a `readystatechange` listener added first runs
+      // before any `load` handler assigned after `open`, which is the only
+      // ordering that lets the body be rewritten before it is read.
+      if (this.__ytproListening !== true) {
+        this.__ytproListening = true;
+
+        try {
+          this.addEventListener("readystatechange", function () {
+            if (this.__ytproIsPlayerRequest !== true) {
+              return;
+            }
+
+            try {
+              sanitizePlayerXHR(this);
+            } catch (_) {
+              // A response the player never reads is not worth failing over.
+            }
+          });
+        } catch (_) {
+          // Some WebKit builds refuse listeners on an unsent request.
+          this.__ytproListening = false;
+        }
+      }
+
+      return originalOpen.apply(this, arguments);
+    };
+
+    requestConstructor.__ytproPatched = true;
   }
 
   function installInitialPlayerResponsePatch() {
@@ -488,8 +691,34 @@
     }
   }
 
+  // Whatever transport the player uses, a JSON body reaches it through
+  // `JSON.parse` — and the device log showed watch loads whose response passed
+  // through neither the patched `fetch` nor `XMLHttpRequest`, so the ad
+  // scheduling survived every request-level patch. Parsing is the one
+  // chokepoint they all share.
+  function installJSONParsePatch() {
+    if (typeof nativeJSONParse !== "function" || JSON.parse.__ytproPatched === true) {
+      return;
+    }
+
+    function patchedParse() {
+      const value = nativeJSONParse.apply(this, arguments);
+
+      if (looksLikePlayerResponse(value)) {
+        sanitizePlayerResponse(value, "json.parse");
+      }
+
+      return value;
+    }
+
+    patchedParse.__ytproPatched = true;
+    JSON.parse = patchedParse;
+  }
+
   function installPlayerResponsePatches() {
     installPlayerFetchPatch();
+    installPlayerXHRPatch();
+    installJSONParsePatch();
     installInitialPlayerResponsePatch();
     sanitizeKnownPlayerGlobals();
   }
@@ -502,22 +731,115 @@
     }
   }
 
-  function hasInStreamAdEvidence(player) {
-    for (const selector of inStreamAdEvidenceSelectors) {
+  function firstMatchingSelector(player, selectors) {
+    for (const selector of selectors) {
       try {
         if (player.querySelectorAll(selector).length > 0) {
-          return true;
+          return selector;
         }
       } catch (_) {
         // Keep trying selector variants supported by this WebKit.
       }
     }
 
+    return null;
+  }
+
+  function videoIsInsideAdPlayer(video) {
+    let node = video;
+
+    while (node) {
+      if (typeof node.matches === "function") {
+        for (const selector of seekableAdPlayerSelectors) {
+          try {
+            if (node.matches(selector)) {
+              return true;
+            }
+          } catch (_) {
+            // Some WebKit builds do not support every selector variant.
+          }
+        }
+      }
+
+      node = node.parentElement;
+    }
+
     return false;
   }
 
+  function shieldAdVideo(video, evidence) {
+    if (shieldedAdVideo === video) {
+      return;
+    }
+
+    releaseAdShield();
+    shieldedAdVideo = video;
+    shieldedAdMuted = video.muted === true;
+    shieldedAdPlaybackRate = Number(video.playbackRate) || 1;
+
+    try {
+      video.muted = true;
+      video.playbackRate = forcedAdPlaybackRate;
+    } catch (_) {
+      // The element may refuse the rate; muting alone is still worth having.
+    }
+
+    // The player owns these properties too and can overrule either one, so what
+    // actually stuck is worth recording rather than assuming. The selector that
+    // triggered the detection is what tells a real break apart from a container
+    // div that is always in the DOM.
+    logToNative(
+      "ad: shielded, muted=" + (video.muted === true) +
+      " rate=" + video.playbackRate +
+      " evidence=" + evidence
+    );
+  }
+
+  function releaseAdShield() {
+    const video = shieldedAdVideo;
+
+    if (!video) {
+      return;
+    }
+
+    shieldedAdVideo = null;
+
+    try {
+      video.muted = shieldedAdMuted;
+      video.playbackRate = shieldedAdPlaybackRate;
+    } catch (_) {
+      // The player may already have replaced the element.
+    }
+  }
+
+  // The break is over as soon as the element leaves the ad player, which the
+  // player signals by dropping the class the shield was keyed on. Walking the
+  // element's own ancestors keeps this off the document-wide query path.
+  function releaseAdShieldIfContentResumed() {
+    if (shieldedAdVideo && (!shieldedAdVideo.isConnected || !videoIsInsideAdPlayer(shieldedAdVideo))) {
+      releaseAdShield();
+    }
+  }
+
+  function furthestSeekableTime(video) {
+    try {
+      const seekable = video.seekable;
+
+      if (seekable && seekable.length > 0) {
+        return Number(seekable.end(seekable.length - 1));
+      }
+    } catch (_) {
+      // The element may not have a media source attached yet.
+    }
+
+    return Number.NaN;
+  }
+
   function finishInStreamAd(player) {
-    if (!hasInStreamAdEvidence(player)) {
+    const liveEvidence = firstMatchingSelector(player, liveAdEvidenceSelectors);
+    const evidence = liveEvidence || firstMatchingSelector(player, persistentAdContainerSelectors);
+
+    if (!evidence) {
       logAdDiagnostic("no-ui-evidence", null);
       return;
     }
@@ -546,13 +868,51 @@
     const duration = Number(video.duration);
     const currentTime = Number(video.currentTime);
 
-    if (!Number.isFinite(duration) || duration <= 0) {
-      logAdDiagnostic("duration-unavailable", video);
+    // NaN or zero is metadata that has not arrived yet — the very start of a
+    // break, and still eligible. An unbounded stream is never a break.
+    //
+    // Length only matters when the detection is weak. The ad's own countdown
+    // or skip control being on screen settles the question by itself, and a
+    // 300-second ad refused for being too long is exactly what played through
+    // in full before this distinction existed.
+    const durationIsPending = Number.isNaN(duration) || duration <= 0;
+    const lengthIsPlausible = liveEvidence !== null ||
+      duration <= maximumForcedAdDurationSeconds;
+    const durationRulesOutAnAd = !durationIsPending &&
+      !(Number.isFinite(duration) && lengthIsPlausible);
+
+    if (durationRulesOutAnAd) {
+      releaseAdShield();
+      logAdDiagnostic("duration-not-an-ad:" + evidence, video);
       return;
     }
 
-    if (duration > maximumForcedAdDurationSeconds) {
-      logAdDiagnostic("duration-too-long", video);
+    // Applied before the seek is even attempted: a duration that is still
+    // pending is the very start of the break, which is exactly when a refused
+    // seek would otherwise let the ad play out loud.
+    shieldAdVideo(video, evidence);
+
+
+    if (durationIsPending) {
+      // A break whose metadata has not landed still has a buffered range, and
+      // its end is where the ad stops. Using it here is what removes the poll
+      // cycle the ad used to be visible for. The same length guard applies, so
+      // content the player mislabelled is never skipped wholesale.
+      const seekableEnd = furthestSeekableTime(video);
+
+      if (Number.isFinite(seekableEnd) && seekableEnd > 0 &&
+        seekableEnd <= maximumForcedAdDurationSeconds &&
+        seekableEnd - Number(video.currentTime) > 0.1) {
+        try {
+          video.currentTime = seekableEnd;
+          logToNative("ad: advanced to the buffered end at " + Math.round(seekableEnd * 10) / 10 + "s");
+          return;
+        } catch (_) {
+          // Fall through to the diagnostic; the next poll retries.
+        }
+      }
+
+      logAdDiagnostic("duration-unavailable", video);
       return;
     }
 
@@ -586,6 +946,8 @@
 
     const scope = root && root.querySelectorAll ? root : document;
     const players = new Set();
+
+    releaseAdShieldIfContentResumed();
 
     for (const selector of seekableAdPlayerSelectors) {
       forEachMatchingElement(scope, selector, function (player) {
@@ -727,7 +1089,39 @@
       " paused=" + video.paused +
       " ended=" + video.ended +
       " ready=" + video.readyState +
+      // A clock that advances while this stands still is a frozen picture over
+      // live audio — the shape a throttled media process leaves behind.
+      " frames=" + decodedFrameCount(video) +
       " t=" + Math.round(video.currentTime || 0);
+  }
+
+  // Why the floating window is or is not available for this element. Every
+  // field here is a precondition WebKit checks before it will hand a video to
+  // Picture in Picture, so a line of this is usually enough to tell a refusal
+  // apart from a request that was never made.
+  function describePictureInPictureReadiness(video) {
+    if (!video) {
+      return "video=none";
+    }
+
+    let supported = "unknown";
+
+    try {
+      if (typeof video.webkitSupportsPresentationMode === "function") {
+        supported = String(video.webkitSupportsPresentationMode(PICTURE_IN_PICTURE));
+      }
+    } catch (_) {
+      supported = "threw";
+    }
+
+    return "pipSupported=" + supported +
+      " pipEnabled=" + (document.pictureInPictureEnabled === true) +
+      " pipDisabled=" + (video.disablePictureInPicture === true) +
+      " hasSetter=" + (typeof video.webkitSetPresentationMode === "function") +
+      // A stream WebKit sees as audio only has no picture to float.
+      " size=" + (video.videoWidth || 0) + "x" + (video.videoHeight || 0) +
+      " pageFullscreen=" + isPageFullscreen(video) +
+      " " + describeVideo(video);
   }
 
   function allowPictureInPicture(video) {
@@ -752,6 +1146,61 @@
       }
     } catch (_) {
       // WebKit refuses the transition while another one is still running.
+    }
+  }
+
+  // WebKit never enters the floating window on its own from inline playback:
+  // `HTMLMediaElement::shouldOverrideBackgroundPlaybackRestriction` keeps video
+  // decoding alive across the background transition only for an element that is
+  // *already* in Picture in Picture, and no automatic-from-inline path exists
+  // for web video at all. Inline playback therefore has to ask, or it degrades
+  // to audio the moment the app leaves the screen.
+  //
+  // The request is callable without a user gesture only because the web view
+  // sets `mediaTypesRequiringUserActionForPlayback` to none, which is what
+  // makes WebKit drop its `RequireUserGestureForFullscreen` restriction on iOS.
+  function requestPictureInPicture(video) {
+    const nativeMode = nativePresentationModeOf(video);
+
+    if (nativeMode === PICTURE_IN_PICTURE) {
+      return;
+    }
+
+    // AVKit performs this handover itself out of a native fullscreen
+    // presentation. A request placed into that teardown is both dropped and
+    // destructive — it hides the player view and leaves the media layer
+    // detached, which is the black picture over live audio seen before.
+    if (nativeMode === FULLSCREEN) {
+      logToNative("pip: leaving the fullscreen handover to WebKit");
+      return;
+    }
+
+    if (Date.now() - lastPresentationChangeAt < presentationSettleMilliseconds) {
+      logToNative("pip: skipped, a presentation change is still settling");
+      return;
+    }
+
+    if (typeof video.webkitSetPresentationMode !== "function") {
+      logToNative("pip: skipped, the element has no presentation mode setter");
+      return;
+    }
+
+    try {
+      if (typeof video.webkitSupportsPresentationMode === "function" &&
+        video.webkitSupportsPresentationMode(PICTURE_IN_PICTURE) !== true) {
+        logToNative("pip: refused by the element, " + describePictureInPictureReadiness(video));
+        return;
+      }
+    } catch (_) {
+      // An element that cannot answer the question is still worth asking.
+    }
+
+    try {
+      video.webkitSetPresentationMode(PICTURE_IN_PICTURE);
+      bridgeOpenedPictureInPicture = true;
+      logToNative("pip: requested, " + describePictureInPictureReadiness(video));
+    } catch (error) {
+      logToNative("pip: request threw " + ((error && error.message) || "unknown"));
     }
   }
 
@@ -815,6 +1264,16 @@
       ignoreRejection(video.play());
     }
 
+    // Throttled to roughly a second: the interesting question in the background
+    // is whether the frame count is still moving, and answering it four times a
+    // second would bury every other line.
+    const now = Date.now();
+
+    if (now - lastBackgroundHoldReportAt >= backgroundHoldReportIntervalMilliseconds) {
+      lastBackgroundHoldReportAt = now;
+      logToNative("hold: " + describeVideo(video));
+    }
+
     // Nothing else is done here. The bridge must not ask for Picture in
     // Picture while the app resigns: a request made out of a live native
     // fullscreen presentation makes `AVPlayerViewController` fight its own
@@ -838,6 +1297,11 @@
     foregroundRestoreToken += 1;
     foregroundRestoreInProgress = false;
     closeBackgroundHoldWindow();
+
+    // Forced seeking stops at the edge of the foreground, so nothing would be
+    // left to notice the break ending. A couple of seconds of ad audio is a far
+    // smaller cost than content resuming muted at sixteen times its speed.
+    releaseAdShield();
 
     const video = pickActiveVideo();
     activeVideo = video;
@@ -865,6 +1329,12 @@
       ", " + describeVideo(video)
     );
 
+    // The decisive moment for the floating window: WebKit only performs the
+    // handover itself out of its own native fullscreen presentation, and the
+    // mobile player drives a page fullscreen layout instead. This line records
+    // which of the two the element was actually in.
+    logToNative("pip readiness: " + describePictureInPictureReadiness(video));
+
     if (!backgroundPlaybackIntended) {
       reportPlaybackState();
       return;
@@ -881,20 +1351,12 @@
       ignoreRejection(video.play());
     }
 
-    // Fullscreen playback continues as a floating window; inline playback is
-    // only meant to keep its audio, so its presentation is left untouched.
-    //
-    // The bridge deliberately does not ask for Picture in Picture here. A
-    // request made straight out of the live fullscreen presentation makes
-    // `AVPlayerViewController` fight its own teardown — the `Invalid call` of
-    // `exitFullScreenAnimated` the log shows — which detaches the media layer
-    // and leaves the element flapping between inline and the floating window:
-    // black video over live audio once the app is back. WebKit performs the
-    // fullscreen→Picture in Picture handover itself when the home gesture
-    // backgrounds the app; the bridge only keeps the audio alive in the hold
-    // and hands the window back to inline on the way in. The element is left
-    // exactly as the user left it, so a window WebKit has already switched it
-    // into keeps playing rather than being read as a user pause.
+    // A native fullscreen presentation is handed to the floating window by
+    // AVKit itself, and a request placed into that teardown is dropped and
+    // destructive. Every other presentation — inline, or a page-driven
+    // fullscreen layout WebKit knows nothing about — gets nothing from WebKit
+    // and has to ask, or the trip degrades to audio over a frozen picture.
+    requestPictureInPicture(video);
 
     reportPlaybackState();
   }
@@ -903,7 +1365,7 @@
     appIsActive = false;
 
     logToNative("didEnterBackground: intended=" + backgroundPlaybackIntended +
-      ", " + describeVideo(activeVideo));
+      ", " + describePictureInPictureReadiness(activeVideo));
 
     if (!backgroundPlaybackIntended) {
       return;
@@ -1162,21 +1624,24 @@
     // element whose inline layer was gone — audio kept playing over a black
     // surface.
     //
-    // What separates the two cases is the presentation the element left in. A
-    // window that arrived while the video was in fullscreen is the handoff and
-    // comes back, so the inline player can render again. A window the user
-    // opened from inline playback is theirs and stays theirs.
+    // What separates the two cases is where the window came from. One that
+    // arrived while the video was in fullscreen, and one the bridge opened for
+    // the trip, both come back so the inline player can render again. A window
+    // the user opened for themselves is theirs and stays theirs.
     const leavingPictureInPicture =
       presentationModeOf(video) === PICTURE_IN_PICTURE;
     const targetMode = restorePresentationMode();
-    const windowIsAHandoff =
-      leavingPictureInPicture && backgroundPresentationMode === FULLSCREEN;
+    const windowIsAHandoff = leavingPictureInPicture &&
+      (backgroundPresentationMode === FULLSCREEN || bridgeOpenedPictureInPicture);
+
+    bridgeOpenedPictureInPicture = false;
 
     logToNative(
       "recoverAfterForeground: leavingPiP=" + leavingPictureInPicture +
       " handoff=" + windowIsAHandoff + " target=" + targetMode +
       ", " + describeVideo(video)
     );
+
 
     if (!leavingPictureInPicture) {
       // Not in a floating window at all: revive playback and watch for the
@@ -1211,9 +1676,19 @@
 
     backgroundPlaybackIntended = false;
 
-    // The bridge never opened a window, so there is nothing here to roll back;
-    // a window that exists is the user's or WebKit's own handover and is left
-    // as it is.
+    // A window the bridge opened for a trip that never happened is the bridge's
+    // to close. One the user or WebKit opened is left exactly as it is.
+    if (bridgeOpenedPictureInPicture) {
+      bridgeOpenedPictureInPicture = false;
+
+      const video = activeVideo;
+
+      if (video && presentationModeOf(video) === PICTURE_IN_PICTURE) {
+        logToNative("pip: closing the window opened for a cancelled trip");
+        setPresentationMode(video, INLINE);
+      }
+    }
+
     reportPlaybackState();
   }
 
@@ -1292,7 +1767,8 @@
       return;
     }
 
-    logToNative("presentation changed: " + describeVideo(video));
+    lastPresentationChangeAt = Date.now();
+    logToNative("presentation changed: " + describePictureInPictureReadiness(video));
     reportPlaybackState();
   }
 
@@ -1312,6 +1788,14 @@
     video.addEventListener("playing", function () {
       activeVideo = video;
       lastPlayingObservedAt = Date.now();
+
+      // Once per element, so the floating window's preconditions can be read
+      // off the log without having to background the app first.
+      if (video.dataset.ytproPipLogged !== "1") {
+        video.dataset.ytproPipLogged = "1";
+        logToNative("pip readiness on play: " + describePictureInPictureReadiness(video));
+      }
+
       reportPlaybackState();
     }, { passive: true });
 

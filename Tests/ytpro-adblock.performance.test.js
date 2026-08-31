@@ -41,10 +41,14 @@ class FakeElement {
     this.ended = false;
     this.currentTime = 0;
     this.duration = Number.NaN;
+    this.seekableEnd = Number.NaN;
+    this.muted = false;
+    this.playbackRate = 1;
     this.decodedFrames = 0;
     this.repaintCount = 0;
     this.webkitPresentationMode = "inline";
     this.webkitDisplayingFullscreen = false;
+    this.supportsPictureInPicture = true;
     this.disablePictureInPicture = true;
     this.rect = { width: 320, height: 180 };
     this.styleValues = new Map();
@@ -76,6 +80,14 @@ class FakeElement {
 
   getBoundingClientRect() {
     return this.rect;
+  }
+
+  get seekable() {
+    if (Number.isNaN(this.seekableEnd)) {
+      return { length: 0 };
+    }
+
+    return { length: 1, end: () => this.seekableEnd };
   }
 
   getVideoPlaybackQuality() {
@@ -158,6 +170,10 @@ class FakeElement {
     this.presentationModeRequests.push(mode);
   }
 
+  webkitSupportsPresentationMode(mode) {
+    return mode === "picture-in-picture" ? this.supportsPictureInPicture : true;
+  }
+
   removeAttribute() {
   }
 
@@ -228,6 +244,66 @@ function collectMatches(elements, selector) {
   return matches;
 }
 
+// One class per harness: the patch mutates the prototype it is handed, so a
+// shared class would leak a previous harness's bridge into the next test.
+function createFakeXHRClass() {
+  return class FakeXMLHttpRequest {
+    constructor() {
+      this.readyState = 0;
+      this.responseType = "";
+      this.onload = null;
+      this.listeners = new Map();
+      this.body = "";
+      this.parsedBody = null;
+    }
+
+    get responseText() {
+      return this.body;
+    }
+
+    get response() {
+      if (this.responseType !== "json") {
+        return this.body;
+      }
+
+      // The spec builds the JSON response object once and hands the same one to
+      // every reader, which is what makes editing it in place effective.
+      if (this.parsedBody === null) {
+        this.parsedBody = JSON.parse(this.body);
+      }
+
+      return this.parsedBody;
+    }
+
+    open() {
+      this.readyState = 1;
+    }
+
+    send() {
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+
+    /// Drives the response through the same event order WebKit uses.
+    deliver(body) {
+      this.body = body;
+      this.readyState = 4;
+
+      for (const listener of this.listeners.get("readystatechange") || []) {
+        listener.call(this, { type: "readystatechange" });
+      }
+
+      if (this.onload) {
+        this.onload.call(this, { type: "load" });
+      }
+    }
+  };
+}
+
 function createHarness(options = {}) {
   const documentRoot = new FakeElement("html");
   documentRoot.setConnected(true);
@@ -250,6 +326,7 @@ function createHarness(options = {}) {
   const window = {
     location: { hostname: "m.youtube.com" },
     fetch: options.fetch,
+    XMLHttpRequest: createFakeXHRClass(),
     ytInitialPlayerResponse: options.initialPlayerResponse,
     innerWidth: 390,
     innerHeight: 844,
@@ -279,7 +356,7 @@ function createHarness(options = {}) {
     }
   };
 
-  vm.runInNewContext(scriptSource, {
+  const context = vm.createContext({
     console,
     document,
     // A controllable clock: the bridge separates WebKit's suspension pause from
@@ -289,6 +366,12 @@ function createHarness(options = {}) {
     Node: { ELEMENT_NODE: 1 },
     window
   });
+
+  vm.runInContext(scriptSource, context);
+
+  // The script patches the realm's own `JSON`, so tests have to reach that one
+  // rather than the host's.
+  window.JSON = vm.runInContext("JSON", context);
 
   return {
     advanceClock(milliseconds) {
@@ -474,6 +557,174 @@ test("non-player fetch responses pass through untouched", async () => {
   assert.equal(result.keep, true);
 });
 
+test("a player response parsed off any transport at all is stripped", () => {
+  const harness = createHarness();
+
+  // The device log showed watch loads whose response reached the player
+  // through neither the patched `fetch` nor `XMLHttpRequest`, and the ads in
+  // them survived every request-level patch. Parsing is the chokepoint they
+  // all share.
+  const parsed = harness.window.JSON.parse(JSON.stringify({
+    adPlacements: [{ adPlacementRenderer: {} }],
+    playerAds: [{}],
+    streamingData: { formats: [{ itag: 18 }] },
+    videoDetails: { videoId: "content-video" },
+    nested: { adBreakHeartbeatParams: "ad-heartbeat", keep: true }
+  }));
+
+  assert.equal("adPlacements" in parsed, false);
+  assert.equal("playerAds" in parsed, false);
+  assert.equal("adBreakHeartbeatParams" in parsed.nested, false);
+  assert.equal(parsed.streamingData.formats[0].itag, 18);
+  assert.equal(parsed.videoDetails.videoId, "content-video");
+  assert.equal(parsed.nested.keep, true);
+});
+
+test("JSON that is not a player response is never walked", () => {
+  const harness = createHarness();
+
+  // No marker key, so the guard skips the walk entirely — which is what keeps
+  // the patch off every other payload the page parses. An ad-shaped key that
+  // survives here proves the object was never descended into.
+  const parsed = harness.window.JSON.parse(JSON.stringify({
+    adBreakHeartbeatParams: "unrelated-payload",
+    keep: true
+  }));
+
+  assert.equal(parsed.adBreakHeartbeatParams, "unrelated-payload");
+  assert.equal(parsed.keep, true);
+});
+
+test("a primitive parse result is passed straight through", () => {
+  const harness = createHarness();
+  const parsedArray = harness.window.JSON.parse("[1,2]");
+
+  assert.equal(harness.window.JSON.parse("42"), 42);
+  assert.equal(harness.window.JSON.parse("null"), null);
+  assert.equal(parsedArray.length, 2);
+  assert.equal(parsedArray[1], 2);
+});
+
+test("an ad whose duration has not landed is cut at its buffered end", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.paused = false;
+  video.seekableEnd = 14.5;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.currentTime, 14.5, "the poll cycle the ad used to be visible for is gone");
+  assert.ok(
+    harness.nativeMessages.some(
+      (message) => message.type === "log" && message.message.startsWith("ad: advanced to the buffered end")
+    )
+  );
+});
+
+test("a buffered range too long to be an ad is left alone", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.paused = false;
+  video.seekableEnd = 900;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.currentTime, 0, "the length guard still protects mislabelled content");
+});
+
+test("XMLHttpRequest player responses are stripped before the player reads them", () => {
+  const harness = createHarness();
+  const request = new harness.window.XMLHttpRequest();
+  let bodySeenByThePlayer = null;
+
+  request.open("POST", "https://m.youtube.com/youtubei/v1/player?prettyPrint=false");
+
+  // Assigned after `open`, exactly as the player does it. The strip only helps
+  // if it lands before this handler runs.
+  request.onload = function () {
+    bodySeenByThePlayer = JSON.parse(request.responseText);
+  };
+
+  request.send();
+  request.deliver(JSON.stringify({
+    adPlacements: [{ adPlacementRenderer: {} }],
+    playerAds: [{}],
+    streamingData: { formats: [{ itag: 18 }] },
+    videoDetails: { videoId: "content-video" }
+  }));
+
+  assert.equal("adPlacements" in bodySeenByThePlayer, false);
+  assert.equal("playerAds" in bodySeenByThePlayer, false);
+  assert.deepEqual(bodySeenByThePlayer.streamingData.formats, [{ itag: 18 }]);
+  assert.equal(bodySeenByThePlayer.videoDetails.videoId, "content-video");
+  assert.equal("adPlacements" in JSON.parse(request.response), false, "`response` must agree with `responseText`");
+});
+
+test("XMLHttpRequest json player responses are stripped in place", () => {
+  const harness = createHarness();
+  const request = new harness.window.XMLHttpRequest();
+
+  request.responseType = "json";
+  request.open("POST", "https://m.youtube.com/youtubei/v1/player");
+  request.send();
+  request.deliver(JSON.stringify({
+    adSlots: [{ adSlotRenderer: {} }],
+    videoDetails: { videoId: "content-video" }
+  }));
+
+  assert.equal("adSlots" in request.response, false);
+  assert.equal(request.response.videoDetails.videoId, "content-video");
+});
+
+test("non-player XMLHttpRequest responses pass through untouched", () => {
+  const harness = createHarness();
+  const request = new harness.window.XMLHttpRequest();
+
+  request.open("POST", "https://m.youtube.com/youtubei/v1/search");
+  request.send();
+  request.deliver(JSON.stringify({ adPlacements: ["not-a-player-response"], keep: true }));
+
+  const result = JSON.parse(request.responseText);
+
+  assert.deepEqual(result.adPlacements, ["not-a-player-response"]);
+  assert.equal(result.keep, true);
+});
+
+test("a reused request never serves the body of its previous response", () => {
+  const harness = createHarness();
+  const request = new harness.window.XMLHttpRequest();
+
+  request.open("POST", "https://m.youtube.com/youtubei/v1/player");
+  request.send();
+  request.deliver(JSON.stringify({ adPlacements: [{}], videoDetails: { videoId: "first" } }));
+
+  assert.equal(JSON.parse(request.responseText).videoDetails.videoId, "first");
+
+  request.open("POST", "https://m.youtube.com/youtubei/v1/search");
+  request.send();
+  request.deliver(JSON.stringify({ videoDetails: { videoId: "second" } }));
+
+  assert.equal(
+    JSON.parse(request.responseText).videoDetails.videoId,
+    "second",
+    "the shadowed accessors from the previous response must be gone"
+  );
+});
+
 test("the DOM fallback advances a confirmed in-stream pre-roll", () => {
   const harness = createHarness();
   const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
@@ -494,6 +745,181 @@ test("the DOM fallback advances a confirmed in-stream pre-roll", () => {
   assert.ok(
     harness.nativeMessages.some((message) => message.type === "log" && message.message.startsWith("ad: advanced"))
   );
+});
+
+test("an ad whose end cannot be reached is silenced and run down at speed", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  // The duration is still unknown at the start of the break, so there is
+  // nothing to seek to — the point at which a refused seek used to leave the
+  // ad playing out loud.
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.muted, true);
+  assert.equal(video.playbackRate, 16);
+});
+
+test("content resuming on the shared element gets its sound and speed back", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+  assert.equal(video.muted, true);
+
+  // The player ends the break by dropping the class the shield was keyed on.
+  player.selectors.delete(".html5-video-player.ad-showing");
+  harness.intervals[1].callback();
+
+  assert.equal(video.muted, false);
+  assert.equal(video.playbackRate, 1);
+});
+
+test("a video the user had already muted stays muted after the break", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.paused = false;
+  video.muted = true;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  player.selectors.delete(".html5-video-player.ad-showing");
+  harness.intervals[1].callback();
+
+  assert.equal(video.muted, true, "the element is handed back exactly as it was found");
+});
+
+test("leaving the foreground hands the element back rather than stranding it", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+  assert.equal(video.playbackRate, 16);
+
+  // Nothing runs in the background to notice the break ending, so content must
+  // never be left muted at sixteen times its speed.
+  harness.window.__ytproPrepareForBackground();
+
+  assert.equal(video.muted, false);
+  assert.equal(video.playbackRate, 1);
+});
+
+test("ordinary content is never silenced or accelerated", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player"]);
+  const video = new FakeElement("video");
+
+  video.duration = 600;
+  video.currentTime = 12;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.muted, false);
+  assert.equal(video.playbackRate, 1);
+});
+
+test("a long ad the player is counting down is skipped whatever its length", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  // The ad's own countdown. Nothing but a running ad puts this on screen.
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  video.duration = 300.581;
+  video.currentTime = 1;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  // A break this long refused for exceeding the length cap is exactly what
+  // played through in full on device.
+  assert.equal(video.currentTime, 300.581);
+});
+
+test("a long video behind only a permanent container div is left alone", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  // `.video-ads` sits in the player whether or not an ad is running, so on its
+  // own it says nothing about what is on screen now.
+  const weakEvidence = new FakeElement("div", [".video-ads"]);
+  const video = new FakeElement("video");
+
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(weakEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+  assert.equal(video.playbackRate, 16, "an unknown duration is shielded on the chance it is an ad");
+
+  video.duration = 600;
+  harness.intervals[1].callback();
+
+  assert.equal(video.muted, false);
+  assert.equal(video.playbackRate, 1);
+  assert.equal(video.currentTime, 0, "the length cap still guards a weak detection");
+});
+
+test("a live stream is never silenced or accelerated", () => {
+  const harness = createHarness();
+  const player = new FakeElement("div", [".html5-video-player.ad-showing"]);
+  const adEvidence = new FakeElement("div", [".ytp-ad-duration-remaining"]);
+  const video = new FakeElement("video");
+
+  // An unbounded duration is a live stream, never a break — the player has
+  // simply not dropped the class yet.
+  video.duration = Number.POSITIVE_INFINITY;
+  video.paused = false;
+  harness.documentRoot.append(player);
+  player.append(adEvidence);
+  player.append(video);
+
+  harness.mutationCallback([{ type: "attributes", target: player }]);
+  runNextTimeout(harness, 0);
+
+  assert.equal(video.muted, false);
+  assert.equal(video.playbackRate, 1);
+  assert.equal(video.currentTime, 0);
 });
 
 test("an ad is retried while its duration is initially unavailable", () => {
@@ -522,7 +948,7 @@ test("an ad is retried while its duration is initially unavailable", () => {
   assert.equal(video.currentTime, 30, "the 250ms poll should finish the previously unseekable ad");
 });
 
-test("ordinary, long and live media are never force-seeked", () => {
+test("ordinary and live media are never force-seeked", () => {
   const harness = createHarness();
   const ordinaryPlayer = new FakeElement("div", [".html5-video-player"]);
   const ordinaryVideo = new FakeElement("video");
@@ -535,27 +961,27 @@ test("ordinary, long and live media are never force-seeked", () => {
 
   harness.mutationCallback([{ type: "attributes", target: ordinaryPlayer }]);
   runNextTimeout(harness, 0);
-  assert.equal(ordinaryVideo.currentTime, 12);
+  assert.equal(ordinaryVideo.currentTime, 12, "a player with no ad class is never touched");
   assert.equal(ordinaryVideo.styleValues.get("opacity"), undefined);
 
   const adPlayer = new FakeElement("div", ["ytm-player.ad-showing"]);
   const adEvidence = new FakeElement("div", [".ytp-ad-text"]);
-  const longVideo = new FakeElement("video");
+  const liveVideo = new FakeElement("video");
 
-  longVideo.duration = 600;
-  longVideo.currentTime = 1;
-  longVideo.paused = false;
+  // An unbounded stream is never a break, however strong the evidence looks.
+  liveVideo.duration = Number.POSITIVE_INFINITY;
+  liveVideo.currentTime = 1;
+  liveVideo.paused = false;
   harness.documentRoot.append(adPlayer);
   adPlayer.append(adEvidence);
-  adPlayer.append(longVideo);
+  adPlayer.append(liveVideo);
 
   harness.mutationCallback([{ type: "attributes", target: adPlayer }]);
   runNextTimeout(harness, 0);
-  assert.equal(longVideo.currentTime, 1);
 
-  longVideo.duration = Number.POSITIVE_INFINITY;
-  harness.intervals[1].callback();
-  assert.equal(longVideo.currentTime, 1);
+  assert.equal(liveVideo.currentTime, 1);
+  assert.equal(liveVideo.muted, false);
+  assert.equal(liveVideo.playbackRate, 1);
 });
 
 test("only the actively playing ad video is advanced", () => {
@@ -675,20 +1101,128 @@ test("a manually paused video is never started by the app leaving the foreground
   assert.deepEqual(video.presentationModeRequests, []);
 });
 
-test("inline playback keeps its audio without opening a floating window", () => {
+test("inline playback asks for the floating window, because WebKit never offers it", () => {
   const harness = createHarness();
   const video = attachPlayingVideo(harness);
 
   harness.window.__ytproPrepareForBackground();
-  harness.window.__ytproDidEnterBackground();
 
-  assert.deepEqual(video.presentationModeRequests, [], "audio only playback stays inline");
+  // `shouldOverrideBackgroundPlaybackRestriction` keeps video decoding alive
+  // across the transition only for an element already in the floating window,
+  // and WebKit has no automatic-from-inline path at all. Not asking is what
+  // left the trip as audio over a frozen picture.
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+
+  harness.window.__ytproDidEnterBackground();
 
   // WebKit suspends the media session a moment after the app leaves the screen.
   video.paused = true;
   video.dispatch("pause");
 
   assert.equal(video.playCount, 1);
+});
+
+test("a native fullscreen presentation is still left to WebKit's own handover", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.webkitPresentationMode = "fullscreen";
+  harness.window.__ytproPrepareForBackground();
+
+  // AVKit performs this handover itself, and a request placed into its
+  // teardown is both silently dropped and destructive — it hides the player
+  // view and leaves the media layer detached.
+  assert.deepEqual(video.presentationModeRequests, []);
+});
+
+test("a request is withheld while a presentation change is still settling", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  // WebKit drops any request made while another transition is in flight, so a
+  // change this recent means the answer would be silently discarded.
+  video.setPresentationMode("inline");
+  harness.window.__ytproPrepareForBackground();
+
+  assert.deepEqual(video.presentationModeRequests, []);
+});
+
+test("an element that refuses the floating window is not asked for it", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.supportsPictureInPicture = false;
+  harness.window.__ytproPrepareForBackground();
+
+  assert.deepEqual(video.presentationModeRequests, []);
+  assert.ok(
+    harness.nativeMessages.some(
+      (message) => message.type === "log" && message.message.startsWith("pip: refused by the element")
+    )
+  );
+});
+
+test("a window the bridge opened is handed back on the way in", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+  harness.window.__ytproDidEnterBackground();
+  video.paused = true;
+
+  harness.window.__ytproPrepareForForeground();
+  harness.window.__ytproRecoverAfterForeground();
+
+  assert.deepEqual(
+    video.presentationModeRequests,
+    ["picture-in-picture", "inline"],
+    "the bridge opened this window, so the inline player gets its element back"
+  );
+
+  video.setPresentationMode("inline");
+  runTimeouts(harness, 60);
+
+  assert.equal(video.playCount, 1);
+});
+
+test("a window opened for a trip that never happened is closed again", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+  video.setPresentationMode("picture-in-picture");
+
+  // A banner or Control Center deactivated the app without ever backgrounding
+  // it, so the window the bridge opened has no trip left to serve.
+  harness.window.__ytproCancelBackgroundPreparation();
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture", "inline"]);
+});
+
+test("a page-driven fullscreen layout also has to ask for the window", () => {
+  const harness = createHarness();
+  const playerShell = new FakeElement("ytm-app", ["ytm-app[player-fullscreen]"]);
+
+  harness.documentRoot.append(playerShell);
+
+  const video = attachPlayingVideo(harness);
+
+  harness.window.__ytproPrepareForBackground();
+
+  // WebKit owns no presentation for a layout the page drew itself, so there is
+  // no teardown to fight — and nothing that would happen on its own either.
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
+});
+
+test("a video stretched over the whole viewport is never asked for fullscreen", () => {
+  const harness = createHarness();
+  const video = attachPlayingVideo(harness);
+
+  video.rect = { width: 390, height: 844 };
+  harness.window.__ytproPrepareForBackground();
+
+  assert.deepEqual(video.presentationModeRequests, ["picture-in-picture"]);
 });
 
 test("a suspended web process is resumed by the native hold ping", () => {
@@ -751,29 +1285,6 @@ test("fullscreen playback is left to WebKit's own floating window handover", () 
   // the media layer. WebKit hands the video to the floating window itself.
   assert.deepEqual(video.presentationModeRequests, []);
   assert.equal(video.disablePictureInPicture, false, "the player may forbid the floating window");
-});
-
-test("page-driven fullscreen is also left to the player", () => {
-  const harness = createHarness();
-  const playerShell = new FakeElement("ytm-app", ["ytm-app[player-fullscreen]"]);
-
-  harness.documentRoot.append(playerShell);
-
-  const video = attachPlayingVideo(harness);
-
-  harness.window.__ytproPrepareForBackground();
-
-  assert.deepEqual(video.presentationModeRequests, []);
-});
-
-test("a video stretched over the whole viewport is still left to the player", () => {
-  const harness = createHarness();
-  const video = attachPlayingVideo(harness);
-
-  video.rect = { width: 390, height: 844 };
-  harness.window.__ytproPrepareForBackground();
-
-  assert.deepEqual(video.presentationModeRequests, []);
 });
 
 test("a pause in the floating window belongs to the user", () => {

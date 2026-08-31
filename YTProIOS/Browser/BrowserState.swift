@@ -1,3 +1,4 @@
+import AVKit
 import Combine
 import UIKit
 import WebKit
@@ -167,6 +168,7 @@ final class BrowserState: NSObject, ObservableObject {
         Self.log.info(
             "willResignActive, playbackActive: \(self.isPlaybackActive), \(AudioSessionController.shared.stateDescription, privacy: .public)"
         )
+        Self.log.info("pip environment: \(Self.pictureInPictureEnvironment, privacy: .public)")
         isPreparedForBackground = true
         hasEnteredBackground = false
 
@@ -291,6 +293,31 @@ final class BrowserState: NSObject, ObservableObject {
         backgroundTaskIdentifier = .invalid
         Self.log.info("background hold ended")
     }
+
+    /// The side of the floating window the web content cannot see: whether the
+    /// device supports it at all, and whether the app was configured to let
+    /// WebKit use it.
+    ///
+    /// `isSimulator` is here because the simulator reports the floating window
+    /// as supported and will even enter it, but its WebKit cannot hold the
+    /// `WebKit Media Playback` process assertion — the content process is then
+    /// throttled the moment the app leaves the screen, decoding stops, and the
+    /// window survives as audio over a frozen frame.
+    private static var pictureInPictureEnvironment: String {
+        let backgroundModes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+
+        #if targetEnvironment(simulator)
+        let isSimulator = true
+        #else
+        let isSimulator = false
+        #endif
+
+        return "systemSupported=\(AVPictureInPictureController.isPictureInPictureSupported())"
+            + " audioBackgroundMode=\(backgroundModes.contains("audio"))"
+            + " isSimulator=\(isSimulator)"
+            + " os=\(UIDevice.current.systemVersion)"
+    }
+
 
     private func callBridge(_ functionName: String) {
         Self.log.debug("bridge → \(functionName, privacy: .public)")
