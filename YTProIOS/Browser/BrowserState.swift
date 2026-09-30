@@ -13,6 +13,7 @@ final class BrowserState: NSObject, ObservableObject {
     override init() {
         let configuration = WKWebViewConfiguration()
         configuration.allowsInlineMediaPlayback = true
+        configuration.allowsPictureInPictureMediaPlayback = false
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true

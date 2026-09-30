@@ -53,7 +53,27 @@
     ".ytp-skip-ad-button"
   ];
 
-  let userStartedPlayback = false;
+  const visibilityState = Object.getOwnPropertyDescriptor(Document.prototype, "visibilityState").get;
+  const play = HTMLVideoElement.prototype.play;
+  const pause = HTMLVideoElement.prototype.pause;
+  const playbackStates = new WeakMap();
+  let backgroundAt = null;
+
+  HTMLVideoElement.prototype.pause = function () {
+    const state = playbackStates.get(this);
+    if (state) {
+      state.wanted = false;
+    }
+    return pause.call(this);
+  };
+
+  try {
+    if (navigator.audioSession) {
+      navigator.audioSession.type = "playback";
+    }
+  } catch (_) {
+    // Older WebKit versions may not expose a writable Audio Session API.
+  }
 
   function hideElement(element) {
     if (!element || element.dataset.ytproHidden === "1") {
@@ -85,25 +105,48 @@
     }
   }
 
-  function rememberPlayback() {
-    for (const video of document.querySelectorAll("video")) {
-      if (!video.paused && !video.ended) {
-        userStartedPlayback = true;
-      }
-    }
-  }
-
-  function resumePlaybackIfNeeded() {
-    if (!userStartedPlayback) {
+  function resumePlaybackIfNeeded(video, state) {
+    if (visibilityState.call(document) === "visible") {
       return;
     }
 
+    const now = performance.now();
+    if (backgroundAt === null) {
+      backgroundAt = now;
+    }
+
+    // debt: WebKit pause events have no cause; allow one recovery within the
+    // 2s background transition, not a keepalive. Use device logs if this window changes.
+    if (!state.wanted || state.resumed || !video.paused || video.ended ||
+        video.muted || video.volume === 0 || !video.isConnected ||
+        now - backgroundAt > 2000 || now - state.pausedAt > 2000 ||
+        navigator.audioSession?.state === "interrupted") {
+      return;
+    }
+
+    state.resumed = true;
+    play.call(video).catch(function () {
+      console.warn("YTPro: background audio resume was denied by WebKit");
+    });
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    const hidden = visibilityState.call(document) !== "visible";
+    backgroundAt = hidden ? (backgroundAt ?? performance.now()) : null;
     for (const video of document.querySelectorAll("video")) {
-      if (video.paused && !video.ended) {
-        video.play().catch(function () {});
+      const state = playbackStates.get(video);
+      if (!state) {
+        continue;
+      }
+      if (hidden) {
+        resumePlaybackIfNeeded(video, state);
+      } else {
+        state.resumed = false;
+        state.wanted = !video.paused && !video.ended;
+        state.pausedAt = -Infinity;
       }
     }
-  }
+  }, true);
 
   function installVisibilityPatch() {
     try {
@@ -134,10 +177,19 @@
         }
 
         video.dataset.ytproObserved = "1";
+        const state = { wanted: !video.paused && !video.ended, resumed: false, pausedAt: -Infinity };
+        playbackStates.set(video, state);
+        const rememberPlayback = function () {
+          state.wanted = !video.paused && !video.ended;
+        };
         video.addEventListener("play", rememberPlayback, { passive: true });
         video.addEventListener("playing", rememberPlayback, { passive: true });
+        video.addEventListener("ended", function () {
+          state.wanted = false;
+        }, { passive: true });
         video.addEventListener("pause", function () {
-          window.setTimeout(resumePlaybackIfNeeded, 400);
+          state.pausedAt = performance.now();
+          resumePlaybackIfNeeded(video, state);
         }, { passive: true });
       });
     } catch (_) {
@@ -147,7 +199,6 @@
   function tick(root) {
     cleanAds(root);
     installMediaListeners(root);
-    rememberPlayback();
   }
 
   installVisibilityPatch();
@@ -172,7 +223,6 @@
     });
     window.setInterval(function () {
       tick(document);
-      resumePlaybackIfNeeded();
     }, 1000);
   }
 

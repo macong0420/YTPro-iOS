@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .moviePlayback, options: [])
-            try session.setActive(true)
+            // WebKit activates its own media session; activating here can interrupt it.
         } catch {
             assertionFailure("Failed to configure audio session: \(error)")
         }
